@@ -1,19 +1,29 @@
+# cython: profile=False
 from collections.abc import Iterable as IterableInstance
-import warnings
+
 import numpy
+
 from murmurhash.mrmr cimport hash64
 
 from ..tokens.doc cimport Doc
 from ..tokens.span cimport Span
-from ..tokens.span import Span
+
 from ..attrs import IDS
-from .alignment import Alignment
-from .iob_utils import biluo_to_iob, offsets_to_biluo_tags, doc_to_biluo_tags
-from .iob_utils import biluo_tags_to_spans
 from ..errors import Errors, Warnings
 from ..pipeline._parser_internals import nonproj
+from ..tokens.span import Span
+from .alignment import Alignment
+from .iob_utils import (
+    biluo_tags_to_spans,
+    biluo_to_iob,
+    doc_to_biluo_tags,
+    offsets_to_biluo_tags,
+    remove_bilu_prefix,
+)
+
 from ..tokens.token cimport MISSING_DEP
-from ..util import logger, to_ternary_int
+
+from ..util import all_equal, logger, to_ternary_int
 
 
 cpdef Doc annotations_to_doc(vocab, tok_annot, doc_annot):
@@ -21,9 +31,9 @@ cpdef Doc annotations_to_doc(vocab, tok_annot, doc_annot):
     attrs, array = _annot2array(vocab, tok_annot, doc_annot)
     output = Doc(vocab, words=tok_annot["ORTH"], spaces=tok_annot["SPACY"])
     if "entities" in doc_annot:
-       _add_entities_to_doc(output, doc_annot["entities"])
+        _add_entities_to_doc(output, doc_annot["entities"])
     if "spans" in doc_annot:
-       _add_spans_to_doc(output, doc_annot["spans"])
+        _add_spans_to_doc(output, doc_annot["spans"])
     if array.size:
         output = output.from_array(attrs, array)
     # links are currently added with ENT_KB_ID on the token level
@@ -78,23 +88,25 @@ cdef class Example:
     def __len__(self):
         return len(self.predicted)
 
-    property predicted:
-        def __get__(self):
-            return self.x
+    @property
+    def predicted(self):
+        return self.x
 
-        def __set__(self, doc):
-            self.x = doc
-            self._cached_alignment = None
-            self._cached_words_x = [t.text for t in doc]
+    @predicted.setter
+    def predicted(self, doc):
+        self.x = doc
+        self._cached_alignment = None
+        self._cached_words_x = [t.text for t in doc]
 
-    property reference:
-        def __get__(self):
-            return self.y
+    @property
+    def reference(self):
+        return self.y
 
-        def __set__(self, doc):
-            self.y = doc
-            self._cached_alignment = None
-            self._cached_words_y = [t.text for t in doc]
+    @reference.setter
+    def reference(self, doc):
+        self.y = doc
+        self._cached_alignment = None
+        self._cached_words_y = [t.text for t in doc]
 
     def copy(self):
         return Example(
@@ -151,63 +163,134 @@ cdef class Example:
                 self._y_sig = y_sig
                 return self._cached_alignment
 
+    def _get_aligned_vectorized(self, align, gold_values):
+        # Fast path for Doc attributes/fields that are predominantly a single value,
+        # i.e., TAG, POS, MORPH.
+        x2y_single_toks = []
+        x2y_single_toks_i = []
+
+        x2y_multiple_toks = []
+        x2y_multiple_toks_i = []
+
+        # Gather indices of gold tokens aligned to the candidate tokens into two buckets.
+        #   Bucket 1: All tokens that have a one-to-one alignment.
+        #   Bucket 2: All tokens that have a one-to-many alignment.
+        for idx, token in enumerate(self.predicted):
+            aligned_gold_i = align[token.i]
+            aligned_gold_len = len(aligned_gold_i)
+
+            if aligned_gold_len == 1:
+                x2y_single_toks.append(aligned_gold_i.item())
+                x2y_single_toks_i.append(idx)
+            elif aligned_gold_len > 1:
+                x2y_multiple_toks.append(aligned_gold_i)
+                x2y_multiple_toks_i.append(idx)
+
+        # Map elements of the first bucket directly to the output array.
+        output = numpy.full(len(self.predicted), None)
+        output[x2y_single_toks_i] = gold_values[x2y_single_toks].squeeze()
+
+        # Collapse many-to-one alignments into one-to-one alignments if they
+        # share the same value. Map to None in all other cases.
+        for i in range(len(x2y_multiple_toks)):
+            aligned_gold_values = gold_values[x2y_multiple_toks[i]]
+
+            # If all aligned tokens have the same value, use it.
+            if all_equal(aligned_gold_values):
+                x2y_multiple_toks[i] = aligned_gold_values[0].item()
+            else:
+                x2y_multiple_toks[i] = None
+
+        output[x2y_multiple_toks_i] = x2y_multiple_toks
+
+        return output.tolist()
+
+    def _get_aligned_non_vectorized(self, align, gold_values):
+        # Slower path for fields that return multiple values (resulting
+        # in ragged arrays that cannot be vectorized trivially).
+        output = [None] * len(self.predicted)
+
+        for token in self.predicted:
+            aligned_gold_i = align[token.i]
+            values = gold_values[aligned_gold_i].ravel()
+            if len(values) == 1:
+                output[token.i] = values.item()
+            elif all_equal(values):
+                # If all aligned tokens have the same value, use it.
+                output[token.i] = values[0].item()
+
+        return output
+
     def get_aligned(self, field, as_string=False):
         """Return an aligned array for a token attribute."""
         align = self.alignment.x2y
+        gold_values = self.reference.to_array([field])
+
+        if len(gold_values.shape) == 1:
+            output = self._get_aligned_vectorized(align, gold_values)
+        else:
+            output = self._get_aligned_non_vectorized(align, gold_values)
 
         vocab = self.reference.vocab
-        gold_values = self.reference.to_array([field])
-        output = [None] * len(self.predicted)
-        for token in self.predicted:
-            if token.is_space:
-                output[token.i] = None
-            else:
-                values = gold_values[align[token.i].dataXd]
-                values = values.ravel()
-                if len(values) == 0:
-                    output[token.i] = None
-                elif len(values) == 1:
-                    output[token.i] = values[0]
-                elif len(set(list(values))) == 1:
-                    # If all aligned tokens have the same value, use it.
-                    output[token.i] = values[0]
-                else:
-                    output[token.i] = None
         if as_string and field not in ["ENT_IOB", "SENT_START"]:
             output = [vocab.strings[o] if o is not None else o for o in output]
+
         return output
 
     def get_aligned_parse(self, projectivize=True):
         cand_to_gold = self.alignment.x2y
         gold_to_cand = self.alignment.y2x
-        aligned_heads = [None] * self.x.length
-        aligned_deps = [None] * self.x.length
-        has_deps = [token.has_dep() for token in self.y]
-        has_heads = [token.has_head() for token in self.y]
         heads = [token.head.i for token in self.y]
         deps = [token.dep_ for token in self.y]
+
         if projectivize:
             proj_heads, proj_deps = nonproj.projectivize(heads, deps)
+            has_deps = [token.has_dep() for token in self.y]
+            has_heads = [token.has_head() for token in self.y]
+
             # ensure that missing data remains missing
             heads = [h if has_heads[i] else heads[i] for i, h in enumerate(proj_heads)]
             deps = [d if has_deps[i] else deps[i] for i, d in enumerate(proj_deps)]
-        for cand_i in range(self.x.length):
-            if cand_to_gold.lengths[cand_i] == 1:
-                gold_i = cand_to_gold[cand_i].dataXd[0, 0]
-                if gold_to_cand.lengths[heads[gold_i]] == 1:
-                    aligned_heads[cand_i] = int(gold_to_cand[heads[gold_i]].dataXd[0, 0])
-                    aligned_deps[cand_i] = deps[gold_i]
-        return aligned_heads, aligned_deps
+
+        # Select all candidate tokens that are aligned to a single gold token.
+        c2g_single_toks = numpy.where(cand_to_gold.lengths == 1)[0]
+
+        # Fetch all aligned gold token incides.
+        if c2g_single_toks.shape == cand_to_gold.lengths.shape:
+            # This the most likely case.
+            gold_i = cand_to_gold[:]
+        else:
+            gold_i = numpy.vectorize(lambda x: cand_to_gold[int(x)][0], otypes='i')(c2g_single_toks)
+
+        # Fetch indices of all gold heads for the aligned gold tokens.
+        heads = numpy.asarray(heads, dtype='i')
+        gold_head_i = heads[gold_i]
+
+        # Select all gold tokens that are heads of the previously selected 
+        # gold tokens (and are aligned to a single candidate token).
+        g2c_len_heads = gold_to_cand.lengths[gold_head_i]
+        g2c_len_heads = numpy.where(g2c_len_heads == 1)[0]
+        g2c_i = numpy.vectorize(lambda x: gold_to_cand[int(x)][0], otypes='i')(gold_head_i[g2c_len_heads]).squeeze()
+
+        # Update head/dep alignments with the above.
+        aligned_heads = numpy.full((self.x.length), None)
+        aligned_heads[c2g_single_toks[g2c_len_heads]] = g2c_i
+
+        deps = numpy.asarray(deps)
+        aligned_deps = numpy.full((self.x.length), None)
+        aligned_deps[c2g_single_toks] = deps[gold_i]
+
+        return aligned_heads.tolist(), aligned_deps.tolist()
 
     def get_aligned_sent_starts(self):
         """Get list of SENT_START attributes aligned to the predicted tokenization.
-        If the reference has not sentence starts, return a list of None values.
+        If the reference does not have sentence starts, return a list of None values.
         """
         if self.y.has_annotation("SENT_START"):
             align = self.alignment.y2x
             sent_starts = [False] * len(self.x)
             for y_sent in self.y.sents:
-                x_start = int(align[y_sent.start].dataXd[0])
+                x_start = int(align[y_sent.start][0])
                 sent_starts[x_start] = True
             return sent_starts
         else:
@@ -223,7 +306,7 @@ cdef class Example:
         seen = set()
         output = []
         for span in spans:
-            indices = align[span.start : span.end].data.ravel()
+            indices = align[span.start : span.end]
             if not allow_overlap:
                 indices = [idx for idx in indices if idx not in seen]
             if len(indices) >= 1:
@@ -246,7 +329,7 @@ cdef class Example:
             missing=None
         )
         # Now fill the tokens we can align to O.
-        O = 2 # I=1, O=2, B=3
+        O = 2 # I=1, O=2, B=3  # no-cython-lint: E741
         for i, ent_iob in enumerate(self.get_aligned("ENT_IOB")):
             if x_tags[i] is None:
                 if ent_iob == O:
@@ -256,14 +339,38 @@ cdef class Example:
         return x_ents, x_tags
 
     def get_aligned_ner(self):
-        x_ents, x_tags = self.get_aligned_ents_and_ner()
+        _x_ents, x_tags = self.get_aligned_ents_and_ner()
         return x_tags
+
+    def get_matching_ents(self, check_label=True):
+        """Return entities that are shared between predicted and reference docs.
+
+        If `check_label` is True, entities must have matching labels to be
+        kept. Otherwise only the character indices need to match.
+        """
+        gold = {}
+        for ent in self.reference.ents:
+            gold[(ent.start_char, ent.end_char)] = ent.label
+
+        keep = []
+        for ent in self.predicted.ents:
+            key = (ent.start_char, ent.end_char)
+            if key not in gold:
+                continue
+
+            if check_label and ent.label != gold[key]:
+                continue
+
+            keep.append(ent)
+
+        return keep
 
     def to_dict(self):
         return {
             "doc_annotation": {
                 "cats": dict(self.reference.cats),
                 "entities": doc_to_biluo_tags(self.reference),
+                "spans": self._spans_to_dict(),
                 "links": self._links_to_dict()
             },
             "token_annotation": {
@@ -278,6 +385,17 @@ cdef class Example:
                 "SENT_START": [int(bool(t.is_sent_start)) for t in self.reference]
             }
         }
+
+    def _spans_to_dict(self):
+        span_dict = {}
+        for key in self.reference.spans:
+            span_tuples = []
+            for span in self.reference.spans[key]: 
+                span_tuple = (span.start_char, span.end_char, span.label_, span.kb_id_)
+                span_tuples.append(span_tuple)
+            span_dict[key] = span_tuples
+
+        return span_dict
 
     def _links_to_dict(self):
         links = {}
@@ -296,7 +414,7 @@ cdef class Example:
         seen_indices = set()
         output = []
         for y_sent in self.reference.sents:
-            indices = align[y_sent.start : y_sent.end].data.ravel()
+            indices = align[y_sent.start : y_sent.end]
             indices = [idx for idx in indices if idx not in seen_indices]
             if indices:
                 x_sent = self.predicted[indices[0] : indices[-1] + 1]
@@ -304,9 +422,9 @@ cdef class Example:
                 seen_indices.update(indices)
         return output
 
-    property text:
-        def __get__(self):
-            return self.x.text
+    @property
+    def text(self):
+        return self.x.text
 
     def __str__(self):
         return str(self.to_dict())
@@ -333,26 +451,27 @@ def _annot2array(vocab, tok_annot, doc_annot):
         if key not in IDS:
             raise ValueError(Errors.E974.format(obj="token", key=key))
         elif key in ["ORTH", "SPACY"]:
-            pass
+            continue
         elif key == "HEAD":
             attrs.append(key)
-            values.append([h-i if h is not None else 0 for i, h in enumerate(value)])
+            row = [h-i if h is not None else 0 for i, h in enumerate(value)]
         elif key == "DEP":
             attrs.append(key)
-            values.append([vocab.strings.add(h) if h is not None else MISSING_DEP for h in value])
+            row = [vocab.strings.add(h) if h is not None else MISSING_DEP for h in value]
         elif key == "SENT_START":
             attrs.append(key)
-            values.append([to_ternary_int(v) for v in value])
+            row = [to_ternary_int(v) for v in value]
         elif key == "MORPH":
             attrs.append(key)
-            values.append([vocab.morphology.add(v) for v in value])
+            row = [vocab.morphology.add(v) for v in value]
         else:
             attrs.append(key)
             if not all(isinstance(v, str) for v in value):
                 types = set([type(v) for v in value])
                 raise TypeError(Errors.E969.format(field=key, types=types)) from None
-            values.append([vocab.strings.add(v) for v in value])
-    array = numpy.asarray(values, dtype="uint64")
+            row = [vocab.strings.add(v) for v in value]
+        values.append([numpy.array(v, dtype=numpy.int32).astype(numpy.uint64) if v < 0 else v for v in row])
+    array = numpy.array(values, dtype=numpy.uint64)
     return attrs, array.T
 
 
@@ -468,6 +587,7 @@ def _fix_legacy_dict_data(example_dict):
         "doc_annotation": doc_dict
     }
 
+
 def _has_field(annot, field):
     if field not in annot:
         return False
@@ -499,10 +619,11 @@ def _parse_ner_tags(biluo_or_offsets, vocab, words, spaces):
         else:
             ent_iobs.append(iob_tag.split("-")[0])
             if iob_tag.startswith("I") or iob_tag.startswith("B"):
-                ent_types.append(iob_tag.split("-", 1)[1])
+                ent_types.append(remove_bilu_prefix(iob_tag))
             else:
                 ent_types.append("")
     return ent_iobs, ent_types
+
 
 def _parse_links(vocab, words, spaces, links):
     reference = Doc(vocab, words=words, spaces=spaces)

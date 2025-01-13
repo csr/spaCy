@@ -45,6 +45,10 @@ _hangul_syllables = r"\uAC00-\uD7AF"
 _hangul_jamo = r"\u1100-\u11FF"
 _hangul = _hangul_syllables + _hangul_jamo
 
+_hiragana = r"\u3040-\u309F"
+_katakana = r"\u30A0-\u30FFー"
+_kana = _hiragana + _katakana
+
 # letters with diacritics - Catalan, Czech, Latin, Latvian, Lithuanian, Polish, Slovak, Turkish, Welsh
 _latin_u_extendedA = (
     r"\u0100\u0102\u0104\u0106\u0108\u010A\u010C\u010E\u0110\u0112\u0114\u0116\u0118\u011A\u011C"
@@ -244,6 +248,7 @@ _uncased = (
     + _tamil
     + _telugu
     + _hangul
+    + _kana
     + _cjk
 )
 
@@ -252,6 +257,10 @@ ALPHA = group_chars(
 )
 ALPHA_LOWER = group_chars(_lower + _uncased)
 ALPHA_UPPER = group_chars(_upper + _uncased)
+
+_combining_diacritics = r"\u0300-\u036f"
+
+COMBINING_DIACRITICS = _combining_diacritics
 
 _units = (
     "km km² km³ m m² m³ dm dm² dm³ cm cm² cm³ mm mm² mm³ ha µm nm yd in ft "
@@ -271,7 +280,7 @@ _currency = (
 _punct = (
     r"… …… , : ; \! \? ¿ ؟ ¡ \( \) \[ \] \{ \} < > _ # \* & 。 ？ ！ ， 、 ； ： ～ · । ، ۔ ؛ ٪"
 )
-_quotes = r'\' " ” “ ` ‘ ´ ’ ‚ , „ » « 「 」 『 』 （ ） 〔 〕 【 】 《 》 〈 〉'
+_quotes = r'\' " ” “ ` ‘ ´ ’ ‚ , „ » « 「 」 『 』 （ ） 〔 〕 【 】 《 》 〈 〉 〈 〉  ⟦ ⟧'
 _hyphens = "- – — -- --- —— ~"
 
 # Various symbols like dingbats, but also emoji

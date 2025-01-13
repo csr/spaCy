@@ -1,16 +1,18 @@
-# cython: infer_types=True, profile=True, binding=True
+# cython: infer_types=True, binding=True
 from collections import defaultdict
-from typing import Optional, Iterable, Callable
-from thinc.api import Model, Config
+from typing import Callable, Optional
+
+from thinc.api import Config, Model
 
 from ._parser_internals.transition_system import TransitionSystem
-from .transition_parser cimport Parser
+
 from ._parser_internals.ner cimport BiluoPushDown
+from .transition_parser cimport Parser
 
 from ..language import Language
-from ..scorer import get_ner_prf, PRFScore
+from ..scorer import get_ner_prf
+from ..training import remove_bilu_prefix
 from ..util import registry
-
 
 default_model_config = """
 [model]
@@ -97,6 +99,7 @@ def make_ner(
         beam_update_prob=0.0,
         scorer=scorer,
     )
+
 
 @Language.factory(
     "beam_ner",
@@ -242,7 +245,7 @@ cdef class EntityRecognizer(Parser):
     def labels(self):
         # Get the labels from the model by looking at the available moves, e.g.
         # B-PERSON, I-PERSON, L-PERSON, U-PERSON
-        labels = set(move.split("-")[1] for move in self.move_names
+        labels = set(remove_bilu_prefix(move) for move in self.move_names
                      if move[0] in ("B", "I", "L", "U"))
         return tuple(sorted(labels))
 

@@ -12,18 +12,24 @@ from spacy.cli.evaluate import print_prf_per_type, print_textcats_auc_per_cat
 from spacy.lang.en import English
 from spacy.language import Language
 from spacy.pipeline import TextCategorizer
-from spacy.pipeline.textcat import single_label_bow_config
-from spacy.pipeline.textcat import single_label_cnn_config
-from spacy.pipeline.textcat import single_label_default_config
-from spacy.pipeline.textcat_multilabel import multi_label_bow_config
-from spacy.pipeline.textcat_multilabel import multi_label_cnn_config
-from spacy.pipeline.textcat_multilabel import multi_label_default_config
+from spacy.pipeline.textcat import (
+    single_label_bow_config,
+    single_label_cnn_config,
+    single_label_default_config,
+)
+from spacy.pipeline.textcat_multilabel import (
+    multi_label_bow_config,
+    multi_label_cnn_config,
+    multi_label_default_config,
+)
 from spacy.pipeline.tok2vec import DEFAULT_TOK2VEC_MODEL
 from spacy.scorer import Scorer
 from spacy.tokens import Doc, DocBin
 from spacy.training import Example
 from spacy.training.initialize import init_nlp
 
+# Ensure that the architecture gets added to the registry.
+from ..tok2vec import build_lazy_init_tok2vec as _
 from ..util import make_tempdir
 
 TRAIN_DATA_SINGLE_LABEL = [
@@ -35,6 +41,13 @@ TRAIN_DATA_MULTI_LABEL = [
     ("I'm angry and confused", {"cats": {"ANGRY": 1.0, "CONFUSED": 1.0, "HAPPY": 0.0}}),
     ("I'm confused but happy", {"cats": {"ANGRY": 0.0, "CONFUSED": 1.0, "HAPPY": 1.0}}),
 ]
+
+lazy_init_model_config = """
+[model]
+@architectures = "test.LazyInitTok2Vec.v1"
+width = 96
+"""
+LAZY_INIT_TOK2VEC_MODEL = Config().from_str(lazy_init_model_config)["model"]
 
 
 def make_get_examples_single_label(nlp):
@@ -277,6 +290,21 @@ def test_issue7019():
     print_prf_per_type(msg, scores, name="foo", type="bar")
 
 
+@pytest.mark.issue(9904)
+def test_issue9904():
+    nlp = Language()
+    textcat = nlp.add_pipe("textcat")
+    get_examples = make_get_examples_single_label(nlp)
+    nlp.initialize(get_examples)
+
+    examples = get_examples()
+    scores = textcat.predict([eg.predicted for eg in examples])
+
+    loss = textcat.get_loss(examples, scores)[0]
+    loss_double_bs = textcat.get_loss(examples * 2, scores.repeat(2, axis=0))[0]
+    assert loss == pytest.approx(loss_double_bs)
+
+
 @pytest.mark.skip(reason="Test is flakey when run with others")
 def test_simple_train():
     nlp = Language()
@@ -345,6 +373,30 @@ def test_label_types(name):
         nlp.initialize()
 
 
+@pytest.mark.parametrize(
+    "name,get_examples",
+    [
+        ("textcat", make_get_examples_single_label),
+        ("textcat_multilabel", make_get_examples_multi_label),
+    ],
+)
+def test_invalid_label_value(name, get_examples):
+    nlp = Language()
+    textcat = nlp.add_pipe(name)
+    example_getter = get_examples(nlp)
+
+    def invalid_examples():
+        # make one example with an invalid score
+        examples = example_getter()
+        ref = examples[0].reference
+        key = list(ref.cats.keys())[0]
+        ref.cats[key] = 2.0
+        return examples
+
+    with pytest.raises(ValueError):
+        nlp.initialize(get_examples=invalid_examples)
+
+
 @pytest.mark.parametrize("name", ["textcat", "textcat_multilabel"])
 def test_no_label(name):
     nlp = Language()
@@ -367,15 +419,19 @@ def test_implicit_label(name, get_examples):
 
 
 # fmt: off
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "name,textcat_config",
     [
-        # BOW
+        # BOW V1
         ("textcat", {"@architectures": "spacy.TextCatBOW.v1", "exclusive_classes": True, "no_output_layer": False, "ngram_size": 3}),
         ("textcat", {"@architectures": "spacy.TextCatBOW.v1", "exclusive_classes": True, "no_output_layer": True, "ngram_size": 3}),
         ("textcat_multilabel", {"@architectures": "spacy.TextCatBOW.v1", "exclusive_classes": False, "no_output_layer": False, "ngram_size": 3}),
         ("textcat_multilabel", {"@architectures": "spacy.TextCatBOW.v1", "exclusive_classes": False, "no_output_layer": True, "ngram_size": 3}),
-        # ENSEMBLE
+        # ENSEMBLE V1
+        ("textcat", {"@architectures": "spacy.TextCatEnsemble.v1", "exclusive_classes": False, "pretrained_vectors": None, "width": 64, "embed_size": 2000, "conv_depth": 2, "window_size": 1, "ngram_size": 1, "dropout": None}),
+        ("textcat_multilabel", {"@architectures": "spacy.TextCatEnsemble.v1", "exclusive_classes": False, "pretrained_vectors": None, "width": 64, "embed_size": 2000, "conv_depth": 2, "window_size": 1, "ngram_size": 1, "dropout": None}),
+        # ENSEMBLE V2
         ("textcat", {"@architectures": "spacy.TextCatEnsemble.v2", "tok2vec": DEFAULT_TOK2VEC_MODEL, "linear_model": {"@architectures": "spacy.TextCatBOW.v1", "exclusive_classes": True, "no_output_layer": False, "ngram_size": 3}}),
         ("textcat", {"@architectures": "spacy.TextCatEnsemble.v2", "tok2vec": DEFAULT_TOK2VEC_MODEL, "linear_model": {"@architectures": "spacy.TextCatBOW.v1", "exclusive_classes": True, "no_output_layer": True, "ngram_size": 3}}),
         ("textcat_multilabel", {"@architectures": "spacy.TextCatEnsemble.v2", "tok2vec": DEFAULT_TOK2VEC_MODEL, "linear_model": {"@architectures": "spacy.TextCatBOW.v1", "exclusive_classes": False, "no_output_layer": False, "ngram_size": 3}}),
@@ -404,14 +460,14 @@ def test_no_resize(name, textcat_config):
 @pytest.mark.parametrize(
     "name,textcat_config",
     [
-        # BOW
-        ("textcat", {"@architectures": "spacy.TextCatBOW.v2", "exclusive_classes": True, "no_output_layer": False, "ngram_size": 3}),
-        ("textcat", {"@architectures": "spacy.TextCatBOW.v2", "exclusive_classes": True, "no_output_layer": True, "ngram_size": 3}),
-        ("textcat_multilabel", {"@architectures": "spacy.TextCatBOW.v2", "exclusive_classes": False, "no_output_layer": False, "ngram_size": 3}),
-        ("textcat_multilabel", {"@architectures": "spacy.TextCatBOW.v2", "exclusive_classes": False, "no_output_layer": True, "ngram_size": 3}),
+        # BOW V3
+        ("textcat", {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": True, "no_output_layer": False, "ngram_size": 3}),
+        ("textcat", {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": True, "no_output_layer": True, "ngram_size": 3}),
+        ("textcat_multilabel", {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": False, "no_output_layer": False, "ngram_size": 3}),
+        ("textcat_multilabel", {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": False, "no_output_layer": True, "ngram_size": 3}),
         # CNN
-        ("textcat", {"@architectures": "spacy.TextCatCNN.v2", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": True}),
-        ("textcat_multilabel", {"@architectures": "spacy.TextCatCNN.v2", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": False}),
+        ("textcat", {"@architectures": "spacy.TextCatReduce.v1", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": True, "use_reduce_first": True, "use_reduce_last": True, "use_reduce_max": True, "use_reduce_mean": True}),
+        ("textcat_multilabel", {"@architectures": "spacy.TextCatReduce.v1", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": False, "use_reduce_first": True, "use_reduce_last": True, "use_reduce_max": True, "use_reduce_mean": True}),
     ],
 )
 # fmt: on
@@ -433,14 +489,14 @@ def test_resize(name, textcat_config):
 @pytest.mark.parametrize(
     "name,textcat_config",
     [
-        # BOW
-        ("textcat", {"@architectures": "spacy.TextCatBOW.v2", "exclusive_classes": True, "no_output_layer": False, "ngram_size": 3}),
-        ("textcat", {"@architectures": "spacy.TextCatBOW.v2", "exclusive_classes": True, "no_output_layer": True, "ngram_size": 3}),
-        ("textcat_multilabel", {"@architectures": "spacy.TextCatBOW.v2", "exclusive_classes": False, "no_output_layer": False, "ngram_size": 3}),
-        ("textcat_multilabel", {"@architectures": "spacy.TextCatBOW.v2", "exclusive_classes": False, "no_output_layer": True, "ngram_size": 3}),
-        # CNN
-        ("textcat", {"@architectures": "spacy.TextCatCNN.v2", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": True}),
-        ("textcat_multilabel", {"@architectures": "spacy.TextCatCNN.v2", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": False}),
+        # BOW v3
+        ("textcat", {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": True, "no_output_layer": False, "ngram_size": 3}),
+        ("textcat", {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": True, "no_output_layer": True, "ngram_size": 3}),
+        ("textcat_multilabel", {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": False, "no_output_layer": False, "ngram_size": 3}),
+        ("textcat_multilabel", {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": False, "no_output_layer": True, "ngram_size": 3}),
+        # REDUCE
+        ("textcat", {"@architectures": "spacy.TextCatReduce.v1", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": True, "use_reduce_first": True, "use_reduce_last": True, "use_reduce_max": True, "use_reduce_mean": True}),
+        ("textcat_multilabel", {"@architectures": "spacy.TextCatReduce.v1", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": False, "use_reduce_first": True, "use_reduce_last": True, "use_reduce_max": True, "use_reduce_mean": True}),
     ],
 )
 # fmt: on
@@ -497,6 +553,34 @@ def test_error_with_multi_labels():
         train_examples.append(Example.from_dict(nlp.make_doc(text), annotations))
     with pytest.raises(ValueError):
         nlp.initialize(get_examples=lambda: train_examples)
+
+
+# fmt: off
+@pytest.mark.parametrize(
+    "name,textcat_config",
+    [
+        # ENSEMBLE V2
+        ("textcat_multilabel", {"@architectures": "spacy.TextCatEnsemble.v2", "tok2vec": LAZY_INIT_TOK2VEC_MODEL, "linear_model": {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": False, "ngram_size": 1, "no_output_layer": False}}),
+        ("textcat", {"@architectures": "spacy.TextCatEnsemble.v2", "tok2vec": LAZY_INIT_TOK2VEC_MODEL, "linear_model": {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": True, "ngram_size": 5, "no_output_layer": False}}),
+        # PARAMETRIC ATTENTION V1
+        ("textcat", {"@architectures": "spacy.TextCatParametricAttention.v1", "tok2vec": LAZY_INIT_TOK2VEC_MODEL, "exclusive_classes": True}),
+        ("textcat_multilabel", {"@architectures": "spacy.TextCatParametricAttention.v1", "tok2vec": LAZY_INIT_TOK2VEC_MODEL, "exclusive_classes": False}),
+        # REDUCE
+        ("textcat", {"@architectures": "spacy.TextCatReduce.v1", "tok2vec": LAZY_INIT_TOK2VEC_MODEL, "exclusive_classes": True, "use_reduce_first": True, "use_reduce_last": True, "use_reduce_max": True, "use_reduce_mean": True}),
+        ("textcat_multilabel", {"@architectures": "spacy.TextCatReduce.v1", "tok2vec": LAZY_INIT_TOK2VEC_MODEL, "exclusive_classes": False, "use_reduce_first": True, "use_reduce_last": True, "use_reduce_max": True, "use_reduce_mean": True}),
+    ],
+)
+# fmt: on
+def test_tok2vec_lazy_init(name, textcat_config):
+    # Check that we can properly initialize and use a textcat model using
+    # a lazily-initialized tok2vec.
+    nlp = English()
+    pipe_config = {"model": textcat_config}
+    textcat = nlp.add_pipe(name, config=pipe_config)
+    textcat.add_label("POSITIVE")
+    textcat.add_label("NEGATIVE")
+    nlp.initialize()
+    nlp.pipe(["This is a test."])
 
 
 @pytest.mark.parametrize(
@@ -628,17 +712,41 @@ def test_overfitting_IO_multi():
 
 
 # fmt: off
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "name,train_data,textcat_config",
     [
+        # BOW V1
+        ("textcat_multilabel", TRAIN_DATA_MULTI_LABEL, {"@architectures": "spacy.TextCatBOW.v1", "exclusive_classes": False, "ngram_size": 1, "no_output_layer": False}),
+        ("textcat", TRAIN_DATA_SINGLE_LABEL, {"@architectures": "spacy.TextCatBOW.v1", "exclusive_classes": True, "ngram_size": 4, "no_output_layer": False}),
+        # ENSEMBLE V1
+        ("textcat_multilabel", TRAIN_DATA_MULTI_LABEL, {"@architectures": "spacy.TextCatEnsemble.v1", "exclusive_classes": False, "pretrained_vectors": None, "width": 64, "embed_size": 2000, "conv_depth": 2, "window_size": 1, "ngram_size": 1, "dropout": None}),
+        ("textcat", TRAIN_DATA_SINGLE_LABEL, {"@architectures": "spacy.TextCatEnsemble.v1", "exclusive_classes": False, "pretrained_vectors": None, "width": 64, "embed_size": 2000, "conv_depth": 2, "window_size": 1, "ngram_size": 1, "dropout": None}),
+        # CNN V1
+        ("textcat", TRAIN_DATA_SINGLE_LABEL, {"@architectures": "spacy.TextCatCNN.v1", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": True}),
+        ("textcat_multilabel", TRAIN_DATA_MULTI_LABEL, {"@architectures": "spacy.TextCatCNN.v1", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": False}),
+        # BOW V2
         ("textcat_multilabel", TRAIN_DATA_MULTI_LABEL, {"@architectures": "spacy.TextCatBOW.v2", "exclusive_classes": False, "ngram_size": 1, "no_output_layer": False}),
         ("textcat", TRAIN_DATA_SINGLE_LABEL, {"@architectures": "spacy.TextCatBOW.v2", "exclusive_classes": True, "ngram_size": 4, "no_output_layer": False}),
         ("textcat_multilabel", TRAIN_DATA_MULTI_LABEL, {"@architectures": "spacy.TextCatBOW.v2", "exclusive_classes": False, "ngram_size": 3, "no_output_layer": True}),
         ("textcat", TRAIN_DATA_SINGLE_LABEL, {"@architectures": "spacy.TextCatBOW.v2", "exclusive_classes": True, "ngram_size": 2, "no_output_layer": True}),
-        ("textcat_multilabel", TRAIN_DATA_MULTI_LABEL, {"@architectures": "spacy.TextCatEnsemble.v2", "tok2vec": DEFAULT_TOK2VEC_MODEL, "linear_model": {"@architectures": "spacy.TextCatBOW.v2", "exclusive_classes": False, "ngram_size": 1, "no_output_layer": False}}),
-        ("textcat", TRAIN_DATA_SINGLE_LABEL, {"@architectures": "spacy.TextCatEnsemble.v2", "tok2vec": DEFAULT_TOK2VEC_MODEL, "linear_model": {"@architectures": "spacy.TextCatBOW.v2", "exclusive_classes": True, "ngram_size": 5, "no_output_layer": False}}),
+        # BOW V3
+        ("textcat_multilabel", TRAIN_DATA_MULTI_LABEL, {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": False, "ngram_size": 1, "no_output_layer": False}),
+        ("textcat", TRAIN_DATA_SINGLE_LABEL, {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": True, "ngram_size": 4, "no_output_layer": False}),
+        ("textcat_multilabel", TRAIN_DATA_MULTI_LABEL, {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": False, "ngram_size": 3, "no_output_layer": True}),
+        ("textcat", TRAIN_DATA_SINGLE_LABEL, {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": True, "ngram_size": 2, "no_output_layer": True}),
+        # ENSEMBLE V2
+        ("textcat_multilabel", TRAIN_DATA_MULTI_LABEL, {"@architectures": "spacy.TextCatEnsemble.v2", "tok2vec": DEFAULT_TOK2VEC_MODEL, "linear_model": {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": False, "ngram_size": 1, "no_output_layer": False}}),
+        ("textcat", TRAIN_DATA_SINGLE_LABEL, {"@architectures": "spacy.TextCatEnsemble.v2", "tok2vec": DEFAULT_TOK2VEC_MODEL, "linear_model": {"@architectures": "spacy.TextCatBOW.v3", "exclusive_classes": True, "ngram_size": 5, "no_output_layer": False}}),
+        # CNN V2 (legacy)
         ("textcat", TRAIN_DATA_SINGLE_LABEL, {"@architectures": "spacy.TextCatCNN.v2", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": True}),
         ("textcat_multilabel", TRAIN_DATA_MULTI_LABEL, {"@architectures": "spacy.TextCatCNN.v2", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": False}),
+        # PARAMETRIC ATTENTION V1
+        ("textcat", TRAIN_DATA_SINGLE_LABEL, {"@architectures": "spacy.TextCatParametricAttention.v1", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": True}),
+        ("textcat_multilabel", TRAIN_DATA_MULTI_LABEL, {"@architectures": "spacy.TextCatParametricAttention.v1", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": False}),
+        # REDUCE V1
+        ("textcat", TRAIN_DATA_SINGLE_LABEL, {"@architectures": "spacy.TextCatReduce.v1", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": True, "use_reduce_first": True, "use_reduce_last": True, "use_reduce_max": True, "use_reduce_mean": True}),
+        ("textcat_multilabel", TRAIN_DATA_MULTI_LABEL, {"@architectures": "spacy.TextCatReduce.v1", "tok2vec": DEFAULT_TOK2VEC_MODEL, "exclusive_classes": False, "use_reduce_first": True, "use_reduce_last": True, "use_reduce_max": True, "use_reduce_mean": True}),
     ],
 )
 # fmt: on
@@ -725,10 +833,76 @@ def test_textcat_evaluation():
     assert scores["cats_micro_r"] == 4 / 6
 
 
-def test_textcat_threshold():
+@pytest.mark.parametrize(
+    "multi_label,spring_p",
+    [(True, 1 / 1), (False, 1 / 2)],
+)
+def test_textcat_eval_missing(multi_label: bool, spring_p: float):
+    """
+    multi-label: the missing 'spring' in gold_doc_2 doesn't incur a penalty
+    exclusive labels: the missing 'spring' in gold_doc_2 is interpreted as 0.0"""
+    train_examples = []
+    nlp = English()
+
+    ref1 = nlp("one")
+    ref1.cats = {"winter": 0.0, "summer": 0.0, "autumn": 0.0, "spring": 1.0}
+    pred1 = nlp("one")
+    pred1.cats = {"winter": 0.0, "summer": 0.0, "autumn": 0.0, "spring": 1.0}
+    train_examples.append(Example(ref1, pred1))
+
+    ref2 = nlp("two")
+    # reference 'spring' is missing, pred 'spring' is 1
+    ref2.cats = {"winter": 0.0, "summer": 0.0, "autumn": 1.0}
+    pred2 = nlp("two")
+    pred2.cats = {"winter": 0.0, "summer": 0.0, "autumn": 0.0, "spring": 1.0}
+    train_examples.append(Example(pred2, ref2))
+
+    scores = Scorer().score_cats(
+        train_examples,
+        "cats",
+        labels=["winter", "summer", "spring", "autumn"],
+        multi_label=multi_label,
+    )
+    assert scores["cats_f_per_type"]["spring"]["p"] == spring_p
+    assert scores["cats_f_per_type"]["spring"]["r"] == 1 / 1
+
+
+@pytest.mark.parametrize(
+    "multi_label,expected_loss",
+    [(True, 0), (False, 0.125)],
+)
+def test_textcat_loss(multi_label: bool, expected_loss: float):
+    """
+    multi-label: the missing 'spring' in gold_doc_2 doesn't incur an increase in loss
+    exclusive labels: the missing 'spring' in gold_doc_2 is interpreted as 0.0 and adds to the loss"""
+    train_examples = []
+    nlp = English()
+
+    doc1 = nlp("one")
+    cats1 = {"winter": 0.0, "summer": 0.0, "autumn": 0.0, "spring": 1.0}
+    train_examples.append(Example.from_dict(doc1, {"cats": cats1}))
+
+    doc2 = nlp("two")
+    cats2 = {"winter": 0.0, "summer": 0.0, "autumn": 1.0}
+    train_examples.append(Example.from_dict(doc2, {"cats": cats2}))
+
+    if multi_label:
+        textcat = nlp.add_pipe("textcat_multilabel")
+    else:
+        textcat = nlp.add_pipe("textcat")
+    assert isinstance(textcat, TextCategorizer)
+    textcat.initialize(lambda: train_examples)
+    scores = textcat.model.ops.asarray(
+        [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]], dtype="f"  # type: ignore
+    )
+    loss, d_scores = textcat.get_loss(train_examples, scores)
+    assert loss == expected_loss
+
+
+def test_textcat_multilabel_threshold():
     # Ensure the scorer can be called with a different threshold
     nlp = English()
-    nlp.add_pipe("textcat")
+    nlp.add_pipe("textcat_multilabel")
 
     train_examples = []
     for text, annotations in TRAIN_DATA_SINGLE_LABEL:
@@ -751,7 +925,7 @@ def test_textcat_threshold():
     )
     pos_f = scores["cats_score"]
     assert scores["cats_f_per_type"]["POSITIVE"]["r"] == 1.0
-    assert pos_f > macro_f
+    assert pos_f >= macro_f
 
 
 def test_textcat_multi_threshold():
@@ -773,3 +947,26 @@ def test_textcat_multi_threshold():
 
     scores = nlp.evaluate(train_examples, scorer_cfg={"threshold": 0})
     assert scores["cats_f_per_type"]["POSITIVE"]["r"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "component_name,scorer",
+    [
+        ("textcat", "spacy.textcat_scorer.v1"),
+        ("textcat_multilabel", "spacy.textcat_multilabel_scorer.v1"),
+    ],
+)
+def test_textcat_legacy_scorers(component_name, scorer):
+    """Check that legacy scorers are registered and produce the expected score
+    keys."""
+    nlp = English()
+    nlp.add_pipe(component_name, config={"scorer": {"@scorers": scorer}})
+
+    train_examples = []
+    for text, annotations in TRAIN_DATA_SINGLE_LABEL:
+        train_examples.append(Example.from_dict(nlp.make_doc(text), annotations))
+    nlp.initialize(get_examples=lambda: train_examples)
+
+    # score the model (it's not actually trained but that doesn't matter)
+    scores = nlp.evaluate(train_examples)
+    assert 0 <= scores["cats_score"] <= 1

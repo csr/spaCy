@@ -1,16 +1,27 @@
+import warnings
 import weakref
 
 import numpy
 import pytest
+from numpy.testing import assert_array_equal
 from thinc.api import NumpyOps, get_current_ops
 
-from spacy.attrs import DEP, ENT_IOB, ENT_TYPE, HEAD, IS_ALPHA, MORPH, POS
-from spacy.attrs import SENT_START, TAG
+from spacy.attrs import (
+    DEP,
+    ENT_IOB,
+    ENT_TYPE,
+    HEAD,
+    IS_ALPHA,
+    MORPH,
+    POS,
+    SENT_START,
+    TAG,
+)
 from spacy.lang.en import English
 from spacy.lang.xx import MultiLanguage
 from spacy.language import Language
 from spacy.lexeme import Lexeme
-from spacy.tokens import Doc, Span, Token
+from spacy.tokens import Doc, Span, SpanGroup, Token
 from spacy.vocab import Vocab
 
 from .test_underscore import clean_underscore  # noqa: F401
@@ -78,6 +89,21 @@ def test_issue2396(en_vocab):
     span = doc[:]
     assert (doc.get_lca_matrix() == matrix).all()
     assert (span.get_lca_matrix() == matrix).all()
+
+
+@pytest.mark.issue(11499)
+def test_init_args_unmodified(en_vocab):
+    words = ["A", "sentence"]
+    ents = ["B-TYPE1", ""]
+    sent_starts = [True, False]
+    Doc(
+        vocab=en_vocab,
+        words=words,
+        ents=ents,
+        sent_starts=sent_starts,
+    )
+    assert ents == ["B-TYPE1", ""]
+    assert sent_starts == [True, False]
 
 
 @pytest.mark.parametrize("text", ["-0.23", "+123,456", "±1"])
@@ -528,9 +554,9 @@ def test_doc_from_array_sent_starts(en_vocab):
     # no warning using default attrs
     attrs = doc._get_array_attrs()
     arr = doc.to_array(attrs)
-    with pytest.warns(None) as record:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         new_doc.from_array(attrs, arr)
-        assert len(record) == 0
     # only SENT_START uses SENT_START
     attrs = [SENT_START]
     arr = doc.to_array(attrs)
@@ -634,6 +660,14 @@ def test_doc_api_from_docs(en_tokenizer, de_tokenizer):
     assert "group" in m_doc.spans
     assert span_group_texts == sorted([s.text for s in m_doc.spans["group"]])
 
+    # can exclude spans
+    m_doc = Doc.from_docs(en_docs, exclude=["spans"])
+    assert "group" not in m_doc.spans
+
+    # can exclude user_data
+    m_doc = Doc.from_docs(en_docs, exclude=["user_data"])
+    assert m_doc.user_data == {}
+
     # can merge empty docs
     doc = Doc.from_docs([en_tokenizer("")] * 10)
 
@@ -646,6 +680,20 @@ def test_doc_api_from_docs(en_tokenizer, de_tokenizer):
     m_doc = Doc.from_docs(en_docs)
     assert "group" in m_doc.spans
     assert len(m_doc.spans["group"]) == 0
+
+    # with tensor
+    ops = get_current_ops()
+    for doc in en_docs:
+        doc.tensor = ops.asarray([[len(t.text), 0.0] for t in doc])
+    m_doc = Doc.from_docs(en_docs)
+    assert_array_equal(
+        ops.to_numpy(m_doc.tensor),
+        ops.to_numpy(ops.xp.vstack([doc.tensor for doc in en_docs if len(doc)])),
+    )
+
+    # can exclude tensor
+    m_doc = Doc.from_docs(en_docs, exclude=["tensor"])
+    assert m_doc.tensor.shape == (0,)
 
 
 def test_doc_api_from_docs_ents(en_tokenizer):
@@ -684,6 +732,7 @@ def test_has_annotation(en_vocab):
     attrs = ("TAG", "POS", "MORPH", "LEMMA", "DEP", "HEAD", "ENT_IOB", "ENT_TYPE")
     for attr in attrs:
         assert not doc.has_annotation(attr)
+        assert not doc.has_annotation(attr, require_complete=True)
 
     doc[0].tag_ = "A"
     doc[0].pos_ = "X"
@@ -704,6 +753,27 @@ def test_has_annotation(en_vocab):
     doc[1].dep_ = "dep"
     doc.ents = [Span(doc, 0, 2, label="HELLO")]
 
+    for attr in attrs:
+        assert doc.has_annotation(attr)
+        assert doc.has_annotation(attr, require_complete=True)
+
+
+def test_has_annotation_sents(en_vocab):
+    doc = Doc(en_vocab, words=["Hello", "beautiful", "world"])
+    attrs = ("SENT_START", "IS_SENT_START", "IS_SENT_END")
+    for attr in attrs:
+        assert not doc.has_annotation(attr)
+        assert not doc.has_annotation(attr, require_complete=True)
+
+    # The first token (index 0) is always assumed to be a sentence start,
+    # and ignored by the check in doc.has_annotation
+
+    doc[1].is_sent_start = False
+    for attr in attrs:
+        assert doc.has_annotation(attr)
+        assert not doc.has_annotation(attr, require_complete=True)
+
+    doc[2].is_sent_start = False
     for attr in attrs:
         assert doc.has_annotation(attr)
         assert doc.has_annotation(attr, require_complete=True)
@@ -919,3 +989,13 @@ def test_doc_spans_copy(en_tokenizer):
     assert weakref.ref(doc1) == doc1.spans.doc_ref
     doc2 = doc1.copy()
     assert weakref.ref(doc2) == doc2.spans.doc_ref
+
+
+def test_doc_spans_setdefault(en_tokenizer):
+    doc = en_tokenizer("Some text about Colombia and the Czech Republic")
+    doc.spans.setdefault("key1")
+    assert len(doc.spans["key1"]) == 0
+    doc.spans.setdefault("key2", default=[doc[0:1]])
+    assert len(doc.spans["key2"]) == 1
+    doc.spans.setdefault("key3", default=SpanGroup(doc, spans=[doc[0:1], doc[1:2]]))
+    assert len(doc.spans["key3"]) == 2

@@ -1,17 +1,21 @@
-from typing import Optional, Union, Any, Dict, List, Tuple, cast
+import os
+import re
 import shutil
-from pathlib import Path
-from wasabi import Printer, MarkdownRenderer, get_raw_input
-from thinc.api import Config
-from collections import defaultdict
-from catalogue import RegistryError
-import srsly
+import subprocess
 import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
-from ._util import app, Arg, Opt, string_to_list, WHEEL_SUFFIX, SDIST_SUFFIX
-from ..schemas import validate, ModelMetaSchema
-from .. import util
-from .. import about
+import srsly
+from catalogue import RegistryError
+from thinc.api import Config
+from wasabi import MarkdownRenderer, Printer, get_raw_input
+
+from .. import about, util
+from ..compat import importlib_metadata
+from ..schemas import ModelMetaSchema, validate
+from ._util import SDIST_SUFFIX, WHEEL_SUFFIX, Arg, Opt, app, string_to_list
 
 
 @app.command("package")
@@ -26,6 +30,7 @@ def package_cli(
     version: Optional[str] = Opt(None, "--version", "-v", help="Package version to override meta"),
     build: str = Opt("sdist", "--build", "-b", help="Comma-separated formats to build: sdist and/or wheel, or none."),
     force: bool = Opt(False, "--force", "-f", "-F", help="Force overwriting existing data in output directory"),
+    require_parent: bool = Opt(True, "--require-parent/--no-require-parent", "-R", "-R", help="Include the parent package (e.g. spacy) in the requirements"),
     # fmt: on
 ):
     """
@@ -34,7 +39,7 @@ def package_cli(
     specified output directory, and the data will be copied over. If
     --create-meta is set and a meta.json already exists in the output directory,
     the existing values will be used as the defaults in the command-line prompt.
-    After packaging, "python setup.py sdist" is run in the package directory,
+    After packaging, "python -m build --sdist" is run in the package directory,
     which will create a .tar.gz archive that can be installed via "pip install".
 
     If additional code files are provided (e.g. Python files containing custom
@@ -56,6 +61,7 @@ def package_cli(
         create_sdist=create_sdist,
         create_wheel=create_wheel,
         force=force,
+        require_parent=require_parent,
         silent=False,
     )
 
@@ -70,6 +76,7 @@ def package(
     create_meta: bool = False,
     create_sdist: bool = True,
     create_wheel: bool = False,
+    require_parent: bool = False,
     force: bool = False,
     silent: bool = True,
 ) -> None:
@@ -77,9 +84,17 @@ def package(
     input_path = util.ensure_path(input_dir)
     output_path = util.ensure_path(output_dir)
     meta_path = util.ensure_path(meta_path)
-    if create_wheel and not has_wheel():
-        err = "Generating a binary .whl file requires wheel to be installed"
-        msg.fail(err, "pip install wheel", exits=1)
+    if create_wheel and not has_wheel() and not has_build():
+        err = (
+            "Generating wheels requires 'build' or 'wheel' (deprecated) to be installed"
+        )
+        msg.fail(err, "pip install build", exits=1)
+    if not has_build():
+        msg.warn(
+            "Generating packages without the 'build' package is deprecated and "
+            "will not be supported in the future. To install 'build': pip "
+            "install build"
+        )
     if not input_path or not input_path.exists():
         msg.fail("Can't locate pipeline data", input_path, exits=1)
     if not output_path or not output_path.exists():
@@ -101,7 +116,7 @@ def package(
     if not meta_path.exists() or not meta_path.is_file():
         msg.fail("Can't load pipeline meta.json", meta_path, exits=1)
     meta = srsly.read_json(meta_path)
-    meta = get_meta(input_dir, meta)
+    meta = get_meta(input_dir, meta, require_parent=require_parent)
     if meta["requirements"]:
         msg.good(
             f"Including {len(meta['requirements'])} package requirement(s) from "
@@ -109,6 +124,24 @@ def package(
             ", ".join(meta["requirements"]),
         )
     if name is not None:
+        if not name.isidentifier():
+            msg.fail(
+                f"Model name ('{name}') is not a valid module name. "
+                "This is required so it can be imported as a module.",
+                "We recommend names that use ASCII A-Z, a-z, _ (underscore), "
+                "and 0-9. "
+                "For specific details see: https://docs.python.org/3/reference/lexical_analysis.html#identifiers",
+                exits=1,
+            )
+        if not _is_permitted_package_name(name):
+            msg.fail(
+                f"Model name ('{name}') is not a permitted package name. "
+                "This is required to correctly load the model with spacy.load.",
+                "We recommend names that use ASCII A-Z, a-z, _ (underscore), "
+                "and 0-9. "
+                "For specific details see: https://www.python.org/dev/peps/pep-0426/#name",
+                exits=1,
+            )
         meta["name"] = name
     if version is not None:
         meta["version"] = version
@@ -156,23 +189,55 @@ def package(
         imports.append(code_path.stem)
         shutil.copy(str(code_path), str(package_path))
     create_file(main_path / "meta.json", srsly.json_dumps(meta, indent=2))
+
     create_file(main_path / "setup.py", TEMPLATE_SETUP)
     create_file(main_path / "MANIFEST.in", TEMPLATE_MANIFEST)
     init_py = TEMPLATE_INIT.format(
         imports="\n".join(f"from . import {m}" for m in imports)
     )
     create_file(package_path / "__init__.py", init_py)
-    msg.good(f"Successfully created package '{model_name_v}'", main_path)
+    msg.good(f"Successfully created package directory '{model_name_v}'", main_path)
     if create_sdist:
         with util.working_dir(main_path):
-            util.run_command([sys.executable, "setup.py", "sdist"], capture=False)
+            # run directly, since util.run_command is not designed to continue
+            # after a command fails
+            ret = subprocess.run(
+                [sys.executable, "-m", "build", ".", "--sdist"],
+                env=os.environ.copy(),
+            )
+            if ret.returncode != 0:
+                msg.warn(
+                    "Creating sdist with 'python -m build' failed. Falling "
+                    "back to deprecated use of 'python setup.py sdist'"
+                )
+                util.run_command([sys.executable, "setup.py", "sdist"], capture=False)
         zip_file = main_path / "dist" / f"{model_name_v}{SDIST_SUFFIX}"
         msg.good(f"Successfully created zipped Python package", zip_file)
     if create_wheel:
         with util.working_dir(main_path):
-            util.run_command([sys.executable, "setup.py", "bdist_wheel"], capture=False)
-        wheel = main_path / "dist" / f"{model_name_v}{WHEEL_SUFFIX}"
+            # run directly, since util.run_command is not designed to continue
+            # after a command fails
+            ret = subprocess.run(
+                [sys.executable, "-m", "build", ".", "--wheel"],
+                env=os.environ.copy(),
+            )
+            if ret.returncode != 0:
+                msg.warn(
+                    "Creating wheel with 'python -m build' failed. Falling "
+                    "back to deprecated use of 'wheel' with "
+                    "'python setup.py bdist_wheel'"
+                )
+                util.run_command(
+                    [sys.executable, "setup.py", "bdist_wheel"], capture=False
+                )
+        wheel_name_squashed = re.sub("_+", "_", model_name_v)
+        wheel = main_path / "dist" / f"{wheel_name_squashed}{WHEEL_SUFFIX}"
         msg.good(f"Successfully created binary wheel", wheel)
+    if "__" in model_name:
+        msg.warn(
+            f"Model name ('{model_name}') contains a run of underscores. "
+            "Runs of underscores are not significant in installed package names.",
+        )
 
 
 def has_wheel() -> bool:
@@ -181,6 +246,17 @@ def has_wheel() -> bool:
 
         return True
     except ImportError:
+        return False
+
+
+def has_build() -> bool:
+    # it's very likely that there is a local directory named build/ (especially
+    # in an editable install), so an import check is not sufficient; instead
+    # check that there is a package version
+    try:
+        importlib_metadata.version("build")
+        return True
+    except importlib_metadata.PackageNotFoundError:  # type: ignore[attr-defined]
         return False
 
 
@@ -227,9 +303,11 @@ def get_third_party_dependencies(
                     raise regerr from None
             module_name = func_info.get("module")  # type: ignore[attr-defined]
             if module_name:  # the code is part of a module, not a --code file
-                modules.add(func_info["module"].split(".")[0])  # type: ignore[index]
+                modules.add(func_info["module"].split(".")[0])  # type: ignore[union-attr]
     dependencies = []
     for module_name in modules:
+        if module_name == about.__title__:
+            continue
         if module_name in distributions:
             dist = distributions.get(module_name)
             if dist:
@@ -260,7 +338,9 @@ def create_file(file_path: Path, contents: str) -> None:
 
 
 def get_meta(
-    model_path: Union[str, Path], existing_meta: Dict[str, Any]
+    model_path: Union[str, Path],
+    existing_meta: Dict[str, Any],
+    require_parent: bool = False,
 ) -> Dict[str, Any]:
     meta: Dict[str, Any] = {
         "lang": "en",
@@ -274,8 +354,8 @@ def get_meta(
     }
     nlp = util.load_model_from_path(Path(model_path))
     meta.update(nlp.meta)
-    meta.update(existing_meta)
     meta["spacy_version"] = util.get_minor_version_range(about.__version__)
+    meta.update(existing_meta)
     meta["vectors"] = {
         "width": nlp.vocab.vectors_length,
         "vectors": len(nlp.vocab.vectors),
@@ -289,6 +369,8 @@ def get_meta(
     existing_reqs = [util.split_requirement(req)[0] for req in meta["requirements"]]
     reqs = get_third_party_dependencies(nlp.config, exclude=existing_reqs)
     meta["requirements"].extend(reqs)
+    if require_parent and about.__title__ not in meta["requirements"]:
+        meta["requirements"].append(about.__title__ + meta["spacy_version"])
     return meta
 
 
@@ -378,7 +460,7 @@ def _format_sources(data: Any) -> str:
         if author:
             result += " ({})".format(author)
         sources.append(result)
-    return "<br />".join(sources)
+    return "<br>".join(sources)
 
 
 def _format_accuracy(data: Dict[str, Any], exclude: List[str] = ["speed"]) -> str:
@@ -422,6 +504,14 @@ def _format_label_scheme(data: Dict[str, Any]) -> str:
     return md.text
 
 
+def _is_permitted_package_name(package_name: str) -> bool:
+    # regex from: https://www.python.org/dev/peps/pep-0426/#name
+    permitted_match = re.search(
+        r"^([A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9])$", package_name, re.IGNORECASE
+    )
+    return permitted_match is not None
+
+
 TEMPLATE_SETUP = """
 #!/usr/bin/env python
 import io
@@ -455,8 +545,11 @@ def list_files(data_dir):
 
 
 def list_requirements(meta):
-    parent_package = meta.get('parent_package', 'spacy')
-    requirements = [parent_package + meta['spacy_version']]
+    # Up to version 3.7, we included the parent package
+    # in requirements by default. This behaviour is removed
+    # in 3.8, with a setting to include the parent package in
+    # the requirements list in the meta if desired.
+    requirements = []
     if 'setup_requires' in meta:
         requirements += meta['setup_requires']
     if 'requirements' in meta:

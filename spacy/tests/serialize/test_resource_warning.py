@@ -1,12 +1,14 @@
 import warnings
 from unittest import TestCase
+
 import pytest
 import srsly
 from numpy import zeros
-from spacy.kb import KnowledgeBase, Writer
-from spacy.vectors import Vectors
+
+from spacy.kb.kb_in_memory import InMemoryLookupKB, Writer
 from spacy.language import Language
 from spacy.pipeline import TrainablePipe
+from spacy.vectors import Vectors
 from spacy.vocab import Vocab
 
 from ..util import make_tempdir
@@ -71,8 +73,8 @@ def entity_linker():
     nlp = Language()
 
     def create_kb(vocab):
-        kb = KnowledgeBase(vocab, entity_vector_length=1)
-        kb.add_entity("test", 0.0, zeros((1, 1), dtype="f"))
+        kb = InMemoryLookupKB(vocab, entity_vector_length=1)
+        kb.add_entity("test", 0.0, zeros((1,), dtype="f"))
         return kb
 
     entity_linker = nlp.add_pipe("entity_linker")
@@ -120,7 +122,7 @@ def test_writer_with_path_py35():
 
 def test_save_and_load_knowledge_base():
     nlp = Language()
-    kb = KnowledgeBase(nlp.vocab, entity_vector_length=1)
+    kb = InMemoryLookupKB(nlp.vocab, entity_vector_length=1)
     with make_tempdir() as d:
         path = d / "kb"
         try:
@@ -129,7 +131,7 @@ def test_save_and_load_knowledge_base():
             pytest.fail(str(e))
 
         try:
-            kb_loaded = KnowledgeBase(nlp.vocab, entity_vector_length=1)
+            kb_loaded = InMemoryLookupKB(nlp.vocab, entity_vector_length=1)
             kb_loaded.from_disk(path)
         except Exception as e:
             pytest.fail(str(e))

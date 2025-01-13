@@ -1,33 +1,26 @@
-# cython: infer_types=True, profile=True, binding=True
-from typing import Callable, Optional
-import numpy
-import srsly
-from thinc.api import Model, set_dropout_rate, SequenceCategoricalCrossentropy, Config
-from thinc.types import Floats2d
-import warnings
+# cython: infer_types=True, binding=True
 from itertools import islice
+from typing import Callable, Optional
+
+import numpy
+from thinc.api import Config, Model, SequenceCategoricalCrossentropy, set_dropout_rate
 
 from ..tokens.doc cimport Doc
-from ..morphology cimport Morphology
-from ..vocab cimport Vocab
 
-from .trainable_pipe import TrainablePipe
-from .pipe import deserialize_config
+from .. import util
+from ..errors import Errors
 from ..language import Language
-from ..attrs import POS, ID
-from ..parts_of_speech import X
-from ..errors import Errors, Warnings
 from ..scorer import Scorer
 from ..training import validate_examples, validate_get_examples
 from ..util import registry
-from .. import util
+from .trainable_pipe import TrainablePipe
 
 # See #9050
 BACKWARD_OVERWRITE = False
 
 default_model_config = """
 [model]
-@architectures = "spacy.Tagger.v1"
+@architectures = "spacy.Tagger.v2"
 
 [model.tok2vec]
 @architectures = "spacy.HashEmbedCNN.v2"
@@ -45,7 +38,7 @@ DEFAULT_TAGGER_MODEL = Config().from_str(default_model_config)["model"]
 @Language.factory(
     "tagger",
     assigns=["token.tag"],
-    default_config={"model": DEFAULT_TAGGER_MODEL, "overwrite": False, "scorer": {"@scorers": "spacy.tagger_scorer.v1"}, "neg_prefix": "!"},
+    default_config={"model": DEFAULT_TAGGER_MODEL, "overwrite": False, "scorer": {"@scorers": "spacy.tagger_scorer.v1"}, "neg_prefix": "!", "label_smoothing": 0.0},
     default_score_weights={"tag_acc": 1.0},
 )
 def make_tagger(
@@ -55,6 +48,7 @@ def make_tagger(
     overwrite: bool,
     scorer: Optional[Callable],
     neg_prefix: str,
+    label_smoothing: float,
 ):
     """Construct a part-of-speech tagger component.
 
@@ -63,7 +57,7 @@ def make_tagger(
         in size, and be normalized as probabilities (all scores between 0 and 1,
         with the rows summing to 1).
     """
-    return Tagger(nlp.vocab, model, name, overwrite=overwrite, scorer=scorer, neg_prefix=neg_prefix)
+    return Tagger(nlp.vocab, model, name, overwrite=overwrite, scorer=scorer, neg_prefix=neg_prefix, label_smoothing=label_smoothing)
 
 
 def tagger_score(examples, **kwargs):
@@ -89,6 +83,7 @@ class Tagger(TrainablePipe):
         overwrite=BACKWARD_OVERWRITE,
         scorer=tagger_score,
         neg_prefix="!",
+        label_smoothing=0.0,
     ):
         """Initialize a part-of-speech tagger.
 
@@ -105,7 +100,7 @@ class Tagger(TrainablePipe):
         self.model = model
         self.name = name
         self._rehearsal_model = None
-        cfg = {"labels": [], "overwrite": overwrite, "neg_prefix": neg_prefix}
+        cfg = {"labels": [], "overwrite": overwrite, "neg_prefix": neg_prefix, "label_smoothing": label_smoothing}
         self.cfg = dict(sorted(cfg.items()))
         self.scorer = scorer
 
@@ -166,7 +161,6 @@ class Tagger(TrainablePipe):
         if isinstance(docs, Doc):
             docs = [docs]
         cdef Doc doc
-        cdef Vocab vocab = self.vocab
         cdef bint overwrite = self.cfg["overwrite"]
         labels = self.labels
         for i, doc in enumerate(docs):
@@ -225,6 +219,7 @@ class Tagger(TrainablePipe):
 
         DOCS: https://spacy.io/api/tagger#rehearse
         """
+        loss_func = SequenceCategoricalCrossentropy()
         if losses is None:
             losses = {}
         losses.setdefault(self.name, 0.0)
@@ -236,12 +231,12 @@ class Tagger(TrainablePipe):
             # Handle cases where there are no tokens in any docs.
             return losses
         set_dropout_rate(self.model, drop)
-        guesses, backprop = self.model.begin_update(docs)
-        target = self._rehearsal_model(examples)
-        gradient = guesses - target
-        backprop(gradient)
+        tag_scores, bp_tag_scores = self.model.begin_update(docs)
+        tutor_tag_scores, _ = self._rehearsal_model.begin_update(docs)
+        grads, loss = loss_func(tag_scores, tutor_tag_scores)
+        bp_tag_scores(grads)
         self.finish_update(sgd)
-        losses[self.name] += (gradient**2).sum()
+        losses[self.name] += loss
         return losses
 
     def get_loss(self, examples, scores):
@@ -255,7 +250,7 @@ class Tagger(TrainablePipe):
         DOCS: https://spacy.io/api/tagger#get_loss
         """
         validate_examples(examples, "Tagger.get_loss")
-        loss_func = SequenceCategoricalCrossentropy(names=self.labels, normalize=False, neg_prefix=self.cfg["neg_prefix"])
+        loss_func = SequenceCategoricalCrossentropy(names=self.labels, normalize=False, neg_prefix=self.cfg["neg_prefix"], label_smoothing=self.cfg["label_smoothing"])
         # Convert empty tag "" to missing value None so that both misaligned
         # tokens and tokens with missing annotation have the default missing
         # value None.

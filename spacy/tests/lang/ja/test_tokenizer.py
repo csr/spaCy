@@ -1,7 +1,8 @@
 import pytest
 
+from spacy.lang.ja import DetailedToken, Japanese
+
 from ...tokenizer.test_naughty_strings import NAUGHTY_STRINGS
-from spacy.lang.ja import Japanese, DetailedToken
 
 # fmt: off
 TOKENIZER_TESTS = [
@@ -142,7 +143,12 @@ def test_ja_tokenizer_sub_tokens(
     [
         (
             "取ってつけた",
-            (["五段-ラ行;連用形-促音便"], [], ["下一段-カ行;連用形-一般"], ["助動詞-タ;終止形-一般"]),
+            (
+                ["五段-ラ行;連用形-促音便"],
+                [],
+                ["下一段-カ行;連用形-一般"],
+                ["助動詞-タ;終止形-一般"],
+            ),
             (["トッ"], ["テ"], ["ツケ"], ["タ"]),
         ),
         ("2=3", ([], [], []), (["ニ"], ["_"], ["サン"])),

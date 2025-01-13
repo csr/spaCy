@@ -3,15 +3,19 @@ import re
 import numpy
 import pytest
 
-from spacy.lang.en import English
 from spacy.lang.de import German
+from spacy.lang.en import English
+from spacy.symbols import ORTH
 from spacy.tokenizer import Tokenizer
 from spacy.tokens import Doc
 from spacy.training import Example
-from spacy.util import compile_prefix_regex, compile_suffix_regex, ensure_path
-from spacy.util import compile_infix_regex
+from spacy.util import (
+    compile_infix_regex,
+    compile_prefix_regex,
+    compile_suffix_regex,
+    ensure_path,
+)
 from spacy.vocab import Vocab
-from spacy.symbols import ORTH
 
 
 @pytest.mark.issue(743)
@@ -520,4 +524,34 @@ def test_tokenizer_infix_prefix(en_vocab):
     tokens = [t.text for t in tokenizer("±10%")]
     assert tokens == ["±10", "%"]
     explain_tokens = [t[1] for t in tokenizer.explain("±10%")]
+    assert tokens == explain_tokens
+
+
+@pytest.mark.issue(10086)
+def test_issue10086(en_tokenizer):
+    """Test special case works when part of infix substring."""
+    text = "No--don't see"
+
+    # without heuristics: do n't
+    en_tokenizer.faster_heuristics = False
+    doc = en_tokenizer(text)
+    assert "n't" in [w.text for w in doc]
+    assert "do" in [w.text for w in doc]
+
+    # with (default) heuristics: don't
+    en_tokenizer.faster_heuristics = True
+    doc = en_tokenizer(text)
+    assert "don't" in [w.text for w in doc]
+
+
+def test_tokenizer_initial_special_case_explain(en_vocab):
+    tokenizer = Tokenizer(
+        en_vocab,
+        token_match=re.compile("^id$").match,
+        rules={
+            "id": [{"ORTH": "i"}, {"ORTH": "d"}],
+        },
+    )
+    tokens = [t.text for t in tokenizer("id")]
+    explain_tokens = [t[1] for t in tokenizer.explain("id")]
     assert tokens == explain_tokens

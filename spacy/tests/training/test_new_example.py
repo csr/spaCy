@@ -1,8 +1,9 @@
 import pytest
-from spacy.training.example import Example
+
 from spacy.tokens import Doc
-from spacy.vocab import Vocab
+from spacy.training.example import Example
 from spacy.util import to_ternary_int
+from spacy.vocab import Vocab
 
 
 def test_Example_init_requires_doc_objects():
@@ -421,3 +422,51 @@ def test_Example_missing_heads():
     # Ensure that the missing head doesn't create an artificial new sentence start
     expected = [True, False, False, False, False, False]
     assert example.get_aligned_sent_starts() == expected
+
+
+def test_Example_aligned_whitespace(en_vocab):
+    words = ["a", " ", "b"]
+    tags = ["A", "SPACE", "B"]
+    predicted = Doc(en_vocab, words=words)
+    reference = Doc(en_vocab, words=words, tags=tags)
+
+    example = Example(predicted, reference)
+    assert example.get_aligned("TAG", as_string=True) == tags
+
+
+@pytest.mark.issue("11260")
+def test_issue11260():
+    annots = {
+        "words": ["I", "like", "New", "York", "."],
+        "spans": {
+            "cities": [(7, 15, "LOC", "")],
+            "people": [(0, 1, "PERSON", "")],
+        },
+    }
+    vocab = Vocab()
+    predicted = Doc(vocab, words=annots["words"])
+    example = Example.from_dict(predicted, annots)
+    assert len(example.reference.spans["cities"]) == 1
+    assert len(example.reference.spans["people"]) == 1
+
+    output_dict = example.to_dict()
+    assert "spans" in output_dict["doc_annotation"]
+    assert output_dict["doc_annotation"]["spans"]["cities"] == annots["spans"]["cities"]
+    assert output_dict["doc_annotation"]["spans"]["people"] == annots["spans"]["people"]
+
+    output_example = Example.from_dict(predicted, output_dict)
+
+    assert len(output_example.reference.spans["cities"]) == len(
+        example.reference.spans["cities"]
+    )
+    assert len(output_example.reference.spans["people"]) == len(
+        example.reference.spans["people"]
+    )
+    for span in example.reference.spans["cities"]:
+        assert span.label_ == "LOC"
+        assert span.text == "New York"
+        assert span.start_char == 7
+    for span in example.reference.spans["people"]:
+        assert span.label_ == "PERSON"
+        assert span.text == "I"
+        assert span.start_char == 0

@@ -1,17 +1,32 @@
-from typing import Optional, List, Union, cast
-from thinc.types import Floats2d, Ints2d, Ragged
-from thinc.api import chain, clone, concatenate, with_array, with_padded
-from thinc.api import Model, noop, list2ragged, ragged2list, HashEmbed
-from thinc.api import expand_window, residual, Maxout, Mish, PyTorchLSTM
+from typing import List, Optional, Union, cast
 
-from ...tokens import Doc
-from ...util import registry
+from thinc.api import (
+    HashEmbed,
+    Maxout,
+    Mish,
+    Model,
+    PyTorchLSTM,
+    chain,
+    clone,
+    concatenate,
+    expand_window,
+    list2ragged,
+    noop,
+    ragged2list,
+    residual,
+    with_array,
+    with_padded,
+)
+from thinc.types import Floats2d, Ints1d, Ints2d, Ragged
+
+from ...attrs import intify_attr
 from ...errors import Errors
 from ...ml import _character_embed
-from ..staticvectors import StaticVectors
-from ..featureextractor import FeatureExtractor
 from ...pipeline.tok2vec import Tok2VecListener
-from ...attrs import intify_attr
+from ...tokens import Doc
+from ...util import registry
+from ..featureextractor import FeatureExtractor
+from ..staticvectors import StaticVectors
 
 
 @registry.architectures("spacy.Tok2VecListener.v1")
@@ -52,8 +67,8 @@ def build_hash_embed_cnn_tok2vec(
         are between 2 and 8.
     window_size (int): The number of tokens on either side to concatenate during
         the convolutions. The receptive field of the CNN will be
-        depth * (window_size * 2 + 1), so a 4-layer network with window_size of
-        2 will be sensitive to 20 words at a time. Recommended value is 1.
+        depth * window_size * 2 + 1, so a 4-layer network with window_size of
+        2 will be sensitive to 17 words at a time. Recommended value is 1.
     embed_size (int): The number of rows in the hash embedding tables. This can
         be surprisingly small, due to the use of the hash embeddings. Recommended
         values are between 2000 and 10000.
@@ -159,7 +174,7 @@ def MultiHashEmbed(
     embeddings = [make_hash_embed(i) for i in range(len(attrs))]
     concat_size = width * (len(embeddings) + include_static_vectors)
     max_out: Model[Ragged, Ragged] = with_array(
-        Maxout(width, concat_size, nP=3, dropout=0.0, normalize=True)  # type: ignore
+        Maxout(width, concat_size, nP=3, dropout=0.0, normalize=True)
     )
     if include_static_vectors:
         feature_extractor: Model[List[Doc], Ragged] = chain(
@@ -173,7 +188,7 @@ def MultiHashEmbed(
                 StaticVectors(width, dropout=0.0),
             ),
             max_out,
-            cast(Model[Ragged, List[Floats2d]], ragged2list()),
+            ragged2list(),
         )
     else:
         model = chain(
@@ -181,7 +196,7 @@ def MultiHashEmbed(
             cast(Model[List[Ints2d], Ragged], list2ragged()),
             with_array(concatenate(*embeddings)),
             max_out,
-            cast(Model[Ragged, List[Floats2d]], ragged2list()),
+            ragged2list(),
         )
     return model
 
@@ -232,12 +247,12 @@ def CharacterEmbed(
     feature_extractor: Model[List[Doc], Ragged] = chain(
         FeatureExtractor([feature]),
         cast(Model[List[Ints2d], Ragged], list2ragged()),
-        with_array(HashEmbed(nO=width, nV=rows, column=0, seed=5)),  # type: ignore
+        with_array(HashEmbed(nO=width, nV=rows, column=0, seed=5)),  # type: ignore[misc]
     )
     max_out: Model[Ragged, Ragged]
     if include_static_vectors:
         max_out = with_array(
-            Maxout(width, nM * nC + (2 * width), nP=3, normalize=True, dropout=0.0)  # type: ignore
+            Maxout(width, nM * nC + (2 * width), nP=3, normalize=True, dropout=0.0)
         )
         model = chain(
             concatenate(
@@ -246,11 +261,11 @@ def CharacterEmbed(
                 StaticVectors(width, dropout=0.0),
             ),
             max_out,
-            cast(Model[Ragged, List[Floats2d]], ragged2list()),
+            ragged2list(),
         )
     else:
         max_out = with_array(
-            Maxout(width, nM * nC + width, nP=3, normalize=True, dropout=0.0)  # type: ignore
+            Maxout(width, nM * nC + width, nP=3, normalize=True, dropout=0.0)
         )
         model = chain(
             concatenate(
@@ -258,7 +273,7 @@ def CharacterEmbed(
                 feature_extractor,
             ),
             max_out,
-            cast(Model[Ragged, List[Floats2d]], ragged2list()),
+            ragged2list(),
         )
     return model
 
@@ -289,10 +304,10 @@ def MaxoutWindowEncoder(
             normalize=True,
         ),
     )
-    model = clone(residual(cnn), depth)  # type: ignore[arg-type]
+    model = clone(residual(cnn), depth)
     model.set_dim("nO", width)
     receptive_field = window_size * depth
-    return with_array(model, pad=receptive_field)  # type: ignore[arg-type]
+    return with_array(model, pad=receptive_field)
 
 
 @registry.architectures("spacy.MishWindowEncoder.v2")
@@ -313,9 +328,9 @@ def MishWindowEncoder(
         expand_window(window_size=window_size),
         Mish(nO=width, nI=width * ((window_size * 2) + 1), dropout=0.0, normalize=True),
     )
-    model = clone(residual(cnn), depth)  # type: ignore[arg-type]
+    model = clone(residual(cnn), depth)
     model.set_dim("nO", width)
-    return with_array(model)  # type: ignore[arg-type]
+    return with_array(model)
 
 
 @registry.architectures("spacy.TorchBiLSTMEncoder.v1")

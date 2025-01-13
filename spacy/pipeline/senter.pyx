@@ -1,26 +1,25 @@
-# cython: infer_types=True, profile=True, binding=True
+# cython: infer_types=True, binding=True
 from itertools import islice
-from typing import Optional, Callable
+from typing import Callable, Optional
 
-import srsly
-from thinc.api import Model, SequenceCategoricalCrossentropy, Config
+from thinc.api import Config, Model, SequenceCategoricalCrossentropy
 
 from ..tokens.doc cimport Doc
 
-from .tagger import Tagger
-from ..language import Language
+from .. import util
 from ..errors import Errors
+from ..language import Language
 from ..scorer import Scorer
 from ..training import validate_examples, validate_get_examples
 from ..util import registry
-from .. import util
+from .tagger import Tagger
 
 # See #9050
 BACKWARD_OVERWRITE = False
 
 default_model_config = """
 [model]
-@architectures = "spacy.Tagger.v1"
+@architectures = "spacy.Tagger.v2"
 
 [model.tok2vec]
 @architectures = "spacy.HashEmbedCNN.v2"

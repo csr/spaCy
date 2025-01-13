@@ -7,8 +7,13 @@ from spacy.attrs import ENT_IOB, ENT_TYPE
 from spacy.lang.en import English
 from spacy.tokenizer import Tokenizer
 from spacy.tokens import Doc
-from spacy.util import compile_infix_regex, compile_prefix_regex
-from spacy.util import compile_suffix_regex, get_lang_class, load_model
+from spacy.util import (
+    compile_infix_regex,
+    compile_prefix_regex,
+    compile_suffix_regex,
+    get_lang_class,
+    load_model,
+)
 
 from ..util import assert_packed_msg_equal, make_tempdir
 
@@ -70,6 +75,7 @@ def test_issue4190():
             suffix_search=suffix_re.search,
             infix_finditer=infix_re.finditer,
             token_match=nlp.tokenizer.token_match,
+            faster_heuristics=False,
         )
         nlp.tokenizer = new_tokenizer
 
@@ -90,6 +96,7 @@ def test_issue4190():
     doc_2 = nlp_2(test_string)
     result_2 = [token.text for token in doc_2]
     assert result_1b == result_2
+    assert nlp_2.tokenizer.faster_heuristics is False
 
 
 def test_serialize_custom_tokenizer(en_vocab, en_tokenizer):

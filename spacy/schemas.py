@@ -1,16 +1,54 @@
-from typing import Dict, List, Union, Optional, Any, Callable, Type, Tuple
-from typing import Iterable, TypeVar, TYPE_CHECKING
-from .compat import Literal
-from enum import Enum
-from pydantic import BaseModel, Field, ValidationError, validator, create_model
-from pydantic import StrictStr, StrictInt, StrictFloat, StrictBool
-from pydantic.main import ModelMetaclass
-from thinc.api import Optimizer, ConfigValidationError, Model
-from thinc.config import Promise
-from collections import defaultdict
 import inspect
+import re
+from collections import defaultdict
+from enum import Enum
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
+
+try:
+    from pydantic.v1 import (
+        BaseModel,
+        ConstrainedStr,
+        Field,
+        StrictBool,
+        StrictFloat,
+        StrictInt,
+        StrictStr,
+        ValidationError,
+        create_model,
+        validator,
+    )
+    from pydantic.v1.main import ModelMetaclass
+except ImportError:
+    from pydantic import (  # type: ignore
+        BaseModel,
+        ConstrainedStr,
+        Field,
+        StrictBool,
+        StrictFloat,
+        StrictInt,
+        StrictStr,
+        ValidationError,
+        create_model,
+        validator,
+    )
+    from pydantic.main import ModelMetaclass  # type: ignore
+from thinc.api import ConfigValidationError, Model, Optimizer
+from thinc.config import Promise
 
 from .attrs import NAMES
+from .compat import Literal
 from .lookups import Lookups
 from .util import is_cython_func
 
@@ -104,7 +142,7 @@ def get_arg_model(
         sig_args[param.name] = (annotation, default)
     is_strict = strict and not has_variable
     sig_args["__config__"] = ArgSchemaConfig if is_strict else ArgSchemaConfigExtra  # type: ignore[assignment]
-    return create_model(name, **sig_args)  # type: ignore[arg-type, return-value]
+    return create_model(name, **sig_args)  # type: ignore[call-overload, arg-type, return-value]
 
 
 def validate_init_settings(
@@ -155,12 +193,40 @@ def validate_token_pattern(obj: list) -> List[str]:
 
 
 class TokenPatternString(BaseModel):
-    REGEX: Optional[StrictStr] = Field(None, alias="regex")
+    REGEX: Optional[Union[StrictStr, "TokenPatternString"]] = Field(None, alias="regex")
     IN: Optional[List[StrictStr]] = Field(None, alias="in")
     NOT_IN: Optional[List[StrictStr]] = Field(None, alias="not_in")
     IS_SUBSET: Optional[List[StrictStr]] = Field(None, alias="is_subset")
     IS_SUPERSET: Optional[List[StrictStr]] = Field(None, alias="is_superset")
     INTERSECTS: Optional[List[StrictStr]] = Field(None, alias="intersects")
+    FUZZY: Optional[Union[StrictStr, "TokenPatternString"]] = Field(None, alias="fuzzy")
+    FUZZY1: Optional[Union[StrictStr, "TokenPatternString"]] = Field(
+        None, alias="fuzzy1"
+    )
+    FUZZY2: Optional[Union[StrictStr, "TokenPatternString"]] = Field(
+        None, alias="fuzzy2"
+    )
+    FUZZY3: Optional[Union[StrictStr, "TokenPatternString"]] = Field(
+        None, alias="fuzzy3"
+    )
+    FUZZY4: Optional[Union[StrictStr, "TokenPatternString"]] = Field(
+        None, alias="fuzzy4"
+    )
+    FUZZY5: Optional[Union[StrictStr, "TokenPatternString"]] = Field(
+        None, alias="fuzzy5"
+    )
+    FUZZY6: Optional[Union[StrictStr, "TokenPatternString"]] = Field(
+        None, alias="fuzzy6"
+    )
+    FUZZY7: Optional[Union[StrictStr, "TokenPatternString"]] = Field(
+        None, alias="fuzzy7"
+    )
+    FUZZY8: Optional[Union[StrictStr, "TokenPatternString"]] = Field(
+        None, alias="fuzzy8"
+    )
+    FUZZY9: Optional[Union[StrictStr, "TokenPatternString"]] = Field(
+        None, alias="fuzzy9"
+    )
 
     class Config:
         extra = "forbid"
@@ -180,12 +246,12 @@ class TokenPatternNumber(BaseModel):
     IS_SUBSET: Optional[List[StrictInt]] = Field(None, alias="is_subset")
     IS_SUPERSET: Optional[List[StrictInt]] = Field(None, alias="is_superset")
     INTERSECTS: Optional[List[StrictInt]] = Field(None, alias="intersects")
-    EQ: Union[StrictInt, StrictFloat] = Field(None, alias="==")
-    NEQ: Union[StrictInt, StrictFloat] = Field(None, alias="!=")
-    GEQ: Union[StrictInt, StrictFloat] = Field(None, alias=">=")
-    LEQ: Union[StrictInt, StrictFloat] = Field(None, alias="<=")
-    GT: Union[StrictInt, StrictFloat] = Field(None, alias=">")
-    LT: Union[StrictInt, StrictFloat] = Field(None, alias="<")
+    EQ: Optional[Union[StrictInt, StrictFloat]] = Field(None, alias="==")
+    NEQ: Optional[Union[StrictInt, StrictFloat]] = Field(None, alias="!=")
+    GEQ: Optional[Union[StrictInt, StrictFloat]] = Field(None, alias=">=")
+    LEQ: Optional[Union[StrictInt, StrictFloat]] = Field(None, alias="<=")
+    GT: Optional[Union[StrictInt, StrictFloat]] = Field(None, alias=">")
+    LT: Optional[Union[StrictInt, StrictFloat]] = Field(None, alias="<")
 
     class Config:
         extra = "forbid"
@@ -198,13 +264,18 @@ class TokenPatternNumber(BaseModel):
         return v
 
 
-class TokenPatternOperator(str, Enum):
+class TokenPatternOperatorSimple(str, Enum):
     plus: StrictStr = StrictStr("+")
-    start: StrictStr = StrictStr("*")
+    star: StrictStr = StrictStr("*")
     question: StrictStr = StrictStr("?")
     exclamation: StrictStr = StrictStr("!")
 
 
+class TokenPatternOperatorMinMax(ConstrainedStr):
+    regex = re.compile(r"^({\d+}|{\d+,\d*}|{\d*,\d+})$")
+
+
+TokenPatternOperator = Union[TokenPatternOperatorSimple, TokenPatternOperatorMinMax]
 StringValue = Union[TokenPatternString, StrictStr]
 NumberValue = Union[TokenPatternNumber, StrictInt, StrictFloat]
 UnderscoreValue = Union[
@@ -323,6 +394,7 @@ class ConfigSchemaTraining(BaseModel):
     frozen_components: List[str] = Field(..., title="Pipeline components that shouldn't be updated during training")
     annotating_components: List[str] = Field(..., title="Pipeline components that should set annotations during training")
     before_to_disk: Optional[Callable[["Language"], "Language"]] = Field(..., title="Optional callback to modify nlp object after training, before it's saved to disk")
+    before_update: Optional[Callable[["Language", Dict[str, Any]], None]] = Field(..., title="Optional callback that is invoked at the start of each training step")
     # fmt: on
 
     class Config:
@@ -340,6 +412,7 @@ class ConfigSchemaNlp(BaseModel):
     after_creation: Optional[Callable[["Language"], "Language"]] = Field(..., title="Optional callback to modify nlp object after creation and before the pipeline is constructed")
     after_pipeline_creation: Optional[Callable[["Language"], "Language"]] = Field(..., title="Optional callback to modify nlp object after the pipeline is constructed")
     batch_size: Optional[int] = Field(..., title="Default batch size")
+    vectors: Callable = Field(..., title="Vectors implementation")
     # fmt: on
 
     class Config:
@@ -408,66 +481,6 @@ CONFIG_SCHEMAS = {
     "initialize": ConfigSchemaInit,
 }
 
-
-# Project config Schema
-
-
-class ProjectConfigAssetGitItem(BaseModel):
-    # fmt: off
-    repo: StrictStr = Field(..., title="URL of Git repo to download from")
-    path: StrictStr = Field(..., title="File path or sub-directory to download (used for sparse checkout)")
-    branch: StrictStr = Field("master", title="Branch to clone from")
-    # fmt: on
-
-
-class ProjectConfigAssetURL(BaseModel):
-    # fmt: off
-    dest: StrictStr = Field(..., title="Destination of downloaded asset")
-    url: Optional[StrictStr] = Field(None, title="URL of asset")
-    checksum: str = Field(None, title="MD5 hash of file", regex=r"([a-fA-F\d]{32})")
-    description: StrictStr = Field("", title="Description of asset")
-    # fmt: on
-
-
-class ProjectConfigAssetGit(BaseModel):
-    # fmt: off
-    git: ProjectConfigAssetGitItem = Field(..., title="Git repo information")
-    checksum: str = Field(None, title="MD5 hash of file", regex=r"([a-fA-F\d]{32})")
-    description: Optional[StrictStr] = Field(None, title="Description of asset")
-    # fmt: on
-
-
-class ProjectConfigCommand(BaseModel):
-    # fmt: off
-    name: StrictStr = Field(..., title="Name of command")
-    help: Optional[StrictStr] = Field(None, title="Command description")
-    script: List[StrictStr] = Field([], title="List of CLI commands to run, in order")
-    deps: List[StrictStr] = Field([], title="File dependencies required by this command")
-    outputs: List[StrictStr] = Field([], title="Outputs produced by this command")
-    outputs_no_cache: List[StrictStr] = Field([], title="Outputs not tracked by DVC (DVC only)")
-    no_skip: bool = Field(False, title="Never skip this command, even if nothing changed")
-    # fmt: on
-
-    class Config:
-        title = "A single named command specified in a project config"
-        extra = "forbid"
-
-
-class ProjectConfigSchema(BaseModel):
-    # fmt: off
-    vars: Dict[StrictStr, Any] = Field({}, title="Optional variables to substitute in commands")
-    env: Dict[StrictStr, Any] = Field({}, title="Optional variable names to substitute in commands, mapped to environment variable names")
-    assets: List[Union[ProjectConfigAssetURL, ProjectConfigAssetGit]] = Field([], title="Data assets")
-    workflows: Dict[StrictStr, List[StrictStr]] = Field({}, title="Named workflows, mapped to list of project commands to run in order")
-    commands: List[ProjectConfigCommand] = Field([], title="Project command shortucts")
-    title: Optional[str] = Field(None, title="Project title")
-    spacy_version: Optional[StrictStr] = Field(None, title="spaCy version range that the project is compatible with")
-    # fmt: on
-
-    class Config:
-        title = "Schema for project configuration file"
-
-
 # Recommendations for init config workflows
 
 
@@ -485,3 +498,37 @@ class RecommendationSchema(BaseModel):
     word_vectors: Optional[str] = None
     transformer: Optional[RecommendationTrf] = None
     has_letters: bool = True
+
+
+class DocJSONSchema(BaseModel):
+    """
+    JSON/dict format for JSON representation of Doc objects.
+    """
+
+    cats: Optional[Dict[StrictStr, StrictFloat]] = Field(
+        None, title="Categories with corresponding probabilities"
+    )
+    ents: Optional[List[Dict[StrictStr, Union[StrictInt, StrictStr]]]] = Field(
+        None, title="Information on entities"
+    )
+    sents: Optional[List[Dict[StrictStr, StrictInt]]] = Field(
+        None, title="Indices of sentences' start and end indices"
+    )
+    text: StrictStr = Field(..., title="Document text")
+    spans: Optional[
+        Dict[StrictStr, List[Dict[StrictStr, Union[StrictStr, StrictInt]]]]
+    ] = Field(None, title="Span information - end/start indices, label, KB ID")
+    tokens: List[Dict[StrictStr, Union[StrictStr, StrictInt]]] = Field(
+        ..., title="Token information - ID, start, annotations"
+    )
+    underscore_doc: Optional[Dict[StrictStr, Any]] = Field(
+        None,
+        title="Any custom data stored in the document's _ attribute",
+        alias="_",
+    )
+    underscore_token: Optional[Dict[StrictStr, List[Dict[StrictStr, Any]]]] = Field(
+        None, title="Any custom data stored in the token's _ attribute"
+    )
+    underscore_span: Optional[Dict[StrictStr, List[Dict[StrictStr, Any]]]] = Field(
+        None, title="Any custom data stored in the span's _ attribute"
+    )
