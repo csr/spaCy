@@ -1,17 +1,15 @@
-# cython: infer_types=True, profile=True
-from typing import List
+# cython: infer_types=True
+import warnings
 from collections import defaultdict
 from itertools import product
+from typing import List
 
-import warnings
-
-from .matcher cimport Matcher
-from ..vocab cimport Vocab
 from ..tokens.doc cimport Doc
+from ..vocab cimport Vocab
+from .matcher cimport Matcher
 
 from ..errors import Errors, Warnings
 from ..tokens import Span
-
 
 DELIMITER = "||"
 INDEX_HEAD = 1
@@ -82,6 +80,14 @@ cdef class DependencyMatcher:
             "$-": self._imm_left_sib,
             "$++": self._right_sib,
             "$--": self._left_sib,
+            ">+": self._imm_right_child,
+            ">-": self._imm_left_child,
+            ">++": self._right_child,
+            ">--": self._left_child,
+            "<+": self._imm_right_parent,
+            "<-": self._imm_left_parent,
+            "<++": self._right_parent,
+            "<--": self._left_parent,
         }
 
     def __reduce__(self):
@@ -102,7 +108,7 @@ cdef class DependencyMatcher:
         key (str): The match ID.
         RETURNS (bool): Whether the matcher contains rules for this match ID.
         """
-        return self.has_key(key)
+        return self.has_key(key)  # no-cython-lint: W601
 
     def _validate_input(self, pattern, key):
         idx = 0
@@ -123,12 +129,20 @@ cdef class DependencyMatcher:
             else:
                 required_keys = {"RIGHT_ID", "RIGHT_ATTRS", "REL_OP", "LEFT_ID"}
                 relation_keys = set(relation.keys())
+                # Identify required keys that have not been specified
                 missing = required_keys - relation_keys
                 if missing:
                     missing_txt = ", ".join(list(missing))
                     raise ValueError(Errors.E100.format(
                         required=required_keys,
                         missing=missing_txt
+                    ))
+                # Identify additional, unsupported keys
+                unsupported = relation_keys - required_keys
+                if unsupported:
+                    unsupported_txt = ", ".join(list(unsupported))
+                    warnings.warn(Warnings.W126.format(
+                        unsupported=unsupported_txt
                     ))
                 if (
                     relation["RIGHT_ID"] in visited_nodes
@@ -258,7 +272,7 @@ cdef class DependencyMatcher:
 
     def remove(self, key):
         key = self._normalize_key(key)
-        if not key in self._patterns:
+        if key not in self._patterns:
             raise ValueError(Errors.E175.format(key=key))
         self._patterns.pop(key)
         self._raw_patterns.pop(key)
@@ -376,7 +390,7 @@ cdef class DependencyMatcher:
             return []
         return [doc[node].head]
 
-    def _gov(self,doc,node):
+    def _gov(self, doc, node):
         return list(doc[node].children)
 
     def _dep_chain(self, doc, node):
@@ -422,6 +436,44 @@ cdef class DependencyMatcher:
 
     def _left_sib(self, doc, node):
         return [doc[child.i] for child in doc[node].head.children if child.i < node]
+
+    def _imm_right_child(self, doc, node):
+        for child in doc[node].rights:
+            if child.i == node + 1:
+                return [doc[child.i]]
+        return []
+
+    def _imm_left_child(self, doc, node):
+        for child in doc[node].lefts:
+            if child.i == node - 1:
+                return [doc[child.i]]
+        return []
+
+    def _right_child(self, doc, node):
+        return [child for child in doc[node].rights]
+
+    def _left_child(self, doc, node):
+        return [child for child in doc[node].lefts]
+
+    def _imm_right_parent(self, doc, node):
+        if doc[node].head.i == node + 1:
+            return [doc[node].head]
+        return []
+
+    def _imm_left_parent(self, doc, node):
+        if doc[node].head.i == node - 1:
+            return [doc[node].head]
+        return []
+
+    def _right_parent(self, doc, node):
+        if doc[node].head.i > node:
+            return [doc[node].head]
+        return []
+
+    def _left_parent(self, doc, node):
+        if doc[node].head.i < node:
+            return [doc[node].head]
+        return []
 
     def _normalize_key(self, key):
         if isinstance(key, str):

@@ -1,30 +1,30 @@
-# cython: infer_types=True, cython: profile=True
-from typing import List
+# cython: binding=True, infer_types=True
+from typing import Iterable, List
 
-from libcpp.vector cimport vector
-from libc.stdint cimport int32_t, int8_t
-from libc.string cimport memset, memcmp
 from cymem.cymem cimport Pool
+from libc.stdint cimport int8_t, int32_t
+from libc.string cimport memcmp, memset
+from libcpp.vector cimport vector
 from murmurhash.mrmr cimport hash64
 
 import re
-import srsly
 import warnings
 
-from ..typedefs cimport attr_t
+import srsly
+
+from ..attrs cimport DEP, ENT_IOB, ID, LEMMA, MORPH, NULL_ATTR, POS, TAG
 from ..structs cimport TokenC
-from ..vocab cimport Vocab
 from ..tokens.doc cimport Doc, get_token_attr_for_matcher
+from ..tokens.morphanalysis cimport MorphAnalysis
 from ..tokens.span cimport Span
 from ..tokens.token cimport Token
-from ..tokens.morphanalysis cimport MorphAnalysis
-from ..attrs cimport ID, attr_id_t, NULL_ATTR, ORTH, POS, TAG, DEP, LEMMA, MORPH, ENT_IOB
+from ..typedefs cimport attr_t
 
-from ..schemas import validate_token_pattern
-from ..errors import Errors, MatchPatternError, Warnings
-from ..strings import get_string_id
 from ..attrs import IDS
-
+from ..errors import Errors, MatchPatternError, Warnings
+from ..schemas import validate_token_pattern
+from ..strings import get_string_id
+from .levenshtein import levenshtein_compare
 
 DEF PADDING = 5
 
@@ -36,11 +36,13 @@ cdef class Matcher:
     USAGE: https://spacy.io/usage/rule-based-matching
     """
 
-    def __init__(self, vocab, validate=True):
+    def __init__(self, vocab, validate=True, *, fuzzy_compare=levenshtein_compare):
         """Create the Matcher.
 
         vocab (Vocab): The vocabulary object, which must be shared with the
-            documents the matcher will operate on.
+        validate (bool): Validate all patterns added to this matcher.
+        fuzzy_compare (Callable[[str, str, int], bool]): The comparison method
+            for the FUZZY operators.
         """
         self._extra_predicates = []
         self._patterns = {}
@@ -51,9 +53,10 @@ cdef class Matcher:
         self.vocab = vocab
         self.mem = Pool()
         self.validate = validate
+        self._fuzzy_compare = fuzzy_compare
 
     def __reduce__(self):
-        data = (self.vocab, self._patterns, self._callbacks)
+        data = (self.vocab, self._patterns, self._callbacks, self.validate, self._fuzzy_compare)
         return (unpickle_matcher, data, None, None)
 
     def __len__(self):
@@ -71,9 +74,9 @@ cdef class Matcher:
         key (str): The match ID.
         RETURNS (bool): Whether the matcher contains rules for this match ID.
         """
-        return self.has_key(key)
+        return self.has_key(key)  # no-cython-lint: W601
 
-    def add(self, key, patterns, *, on_match=None, greedy: str=None):
+    def add(self, key, patterns, *, on_match=None, greedy: str = None):
         """Add a match-rule to the matcher. A match-rule consists of: an ID
         key, an on_match callback, and one or more patterns.
 
@@ -86,10 +89,14 @@ cdef class Matcher:
         is a dictionary mapping attribute IDs to values, and optionally a
         quantifier operator under the key "op". The available quantifiers are:
 
-        '!': Negate the pattern, by requiring it to match exactly 0 times.
-        '?': Make the pattern optional, by allowing it to match 0 or 1 times.
-        '+': Require the pattern to match 1 or more times.
-        '*': Allow the pattern to zero or more times.
+        '!':      Negate the pattern, by requiring it to match exactly 0 times.
+        '?':      Make the pattern optional, by allowing it to match 0 or 1 times.
+        '+':      Require the pattern to match 1 or more times.
+        '*':      Allow the pattern to zero or more times.
+        '{n}':    Require the pattern to match exactly _n_ times.
+        '{n,m}':  Require the pattern to match at least _n_ but not more than _m_ times.
+        '{n,}':   Require the pattern to match at least _n_ times.
+        '{,m}':   Require the pattern to match at most _m_ times.
 
         The + and * operators return all possible matches (not just the greedy
         ones). However, the "greedy" argument can filter the final matches
@@ -123,8 +130,13 @@ cdef class Matcher:
         key = self._normalize_key(key)
         for pattern in patterns:
             try:
-                specs = _preprocess_pattern(pattern, self.vocab,
-                    self._extensions, self._extra_predicates)
+                specs = _preprocess_pattern(
+                    pattern,
+                    self.vocab,
+                    self._extensions,
+                    self._extra_predicates,
+                    self._fuzzy_compare
+                )
                 self.patterns.push_back(init_pattern(self.mem, key, specs))
                 for spec in specs:
                     for attr, _ in spec[1]:
@@ -148,7 +160,7 @@ cdef class Matcher:
         key (str): The ID of the match rule.
         """
         norm_key = self._normalize_key(key)
-        if not norm_key in self._patterns:
+        if norm_key not in self._patterns:
             raise ValueError(Errors.E175.format(key=key))
         self._patterns.pop(norm_key)
         self._callbacks.pop(norm_key)
@@ -244,8 +256,19 @@ cdef class Matcher:
                         pipe = "parser"
                     error_msg = Errors.E155.format(pipe=pipe, attr=self.vocab.strings.as_string(attr))
                     raise ValueError(error_msg)
-        matches = find_matches(&self.patterns[0], self.patterns.size(), doclike, length,
-                                extensions=self._extensions, predicates=self._extra_predicates, with_alignments=with_alignments)
+
+        if self.patterns.empty():
+            matches = []
+        else:
+            matches = find_matches(
+                &self.patterns[0],
+                self.patterns.size(),
+                doclike,
+                length,
+                extensions=self._extensions,
+                predicates=self._extra_predicates,
+                with_alignments=with_alignments
+            )
         final_matches = []
         pairs_by_id = {}
         # For each key, either add all matches, or only the filtered,
@@ -265,9 +288,9 @@ cdef class Matcher:
             memset(matched, 0, length * sizeof(matched[0]))
             span_filter = self._filter.get(key)
             if span_filter == "FIRST":
-                sorted_pairs = sorted(pairs, key=lambda x: (x[0], -x[1]), reverse=False) # sort by start
+                sorted_pairs = sorted(pairs, key=lambda x: (x[0], -x[1]), reverse=False)  # sort by start
             elif span_filter == "LONGEST":
-                sorted_pairs = sorted(pairs, key=lambda x: (x[1]-x[0], -x[0]), reverse=True) # reverse sort by length
+                sorted_pairs = sorted(pairs, key=lambda x: (x[1]-x[0], -x[0]), reverse=True)  # reverse sort by length
             else:
                 raise ValueError(Errors.E947.format(expected=["FIRST", "LONGEST"], arg=span_filter))
             for match in sorted_pairs:
@@ -318,8 +341,8 @@ cdef class Matcher:
             return key
 
 
-def unpickle_matcher(vocab, patterns, callbacks):
-    matcher = Matcher(vocab)
+def unpickle_matcher(vocab, patterns, callbacks, validate, fuzzy_compare):
+    matcher = Matcher(vocab, validate=validate, fuzzy_compare=fuzzy_compare)
     for key, pattern in patterns.items():
         callback = callbacks.get(key, None)
         matcher.add(key, pattern, on_match=callback)
@@ -342,7 +365,6 @@ cdef find_matches(TokenPatternC** patterns, int n, object doclike, int length, e
     cdef vector[MatchC] matches
     cdef vector[vector[MatchAlignmentC]] align_states
     cdef vector[vector[MatchAlignmentC]] align_matches
-    cdef PatternStateC state
     cdef int i, j, nr_extra_attr
     cdef Pool mem = Pool()
     output = []
@@ -364,14 +386,22 @@ cdef find_matches(TokenPatternC** patterns, int n, object doclike, int length, e
                 value = token.vocab.strings[value]
             extra_attr_values[i * nr_extra_attr + index] = value
     # Main loop
-    cdef int nr_predicate = len(predicates)
     for i in range(length):
         for j in range(n):
             states.push_back(PatternStateC(patterns[j], i, 0))
         if with_alignments != 0:
             align_states.resize(states.size())
-        transition_states(states, matches, align_states, align_matches, predicate_cache,
-            doclike[i], extra_attr_values, predicates, with_alignments)
+        transition_states(
+            states,
+            matches,
+            align_states,
+            align_matches,
+            predicate_cache,
+            doclike[i],
+            extra_attr_values,
+            predicates,
+            with_alignments
+        )
         extra_attr_values += nr_extra_attr
         predicate_cache += len(predicates)
     # Handle matches that end in 0-width patterns
@@ -397,18 +427,28 @@ cdef find_matches(TokenPatternC** patterns, int n, object doclike, int length, e
     return output
 
 
-cdef void transition_states(vector[PatternStateC]& states, vector[MatchC]& matches,
-                            vector[vector[MatchAlignmentC]]& align_states, vector[vector[MatchAlignmentC]]& align_matches,
-                            int8_t* cached_py_predicates,
-        Token token, const attr_t* extra_attrs, py_predicates, bint with_alignments) except *:
+cdef void transition_states(
+    vector[PatternStateC]& states,
+    vector[MatchC]& matches,
+    vector[vector[MatchAlignmentC]]& align_states,
+    vector[vector[MatchAlignmentC]]& align_matches,
+    int8_t* cached_py_predicates,
+    Token token,
+    const attr_t* extra_attrs,
+    py_predicates,
+    bint with_alignments
+) except *:
     cdef int q = 0
     cdef vector[PatternStateC] new_states
     cdef vector[vector[MatchAlignmentC]] align_new_states
-    cdef int nr_predicate = len(py_predicates)
     for i in range(states.size()):
         if states[i].pattern.nr_py >= 1:
-            update_predicate_cache(cached_py_predicates,
-                states[i].pattern, token, py_predicates)
+            update_predicate_cache(
+                cached_py_predicates,
+                states[i].pattern,
+                token,
+                py_predicates
+            )
         action = get_action(states[i], token.c, extra_attrs,
                             cached_py_predicates)
         if action == REJECT:
@@ -444,8 +484,12 @@ cdef void transition_states(vector[PatternStateC]& states, vector[MatchC]& match
                     align_new_states.push_back(align_states[q])
             states[q].pattern += 1
             if states[q].pattern.nr_py != 0:
-                update_predicate_cache(cached_py_predicates,
-                    states[q].pattern, token, py_predicates)
+                update_predicate_cache(
+                    cached_py_predicates,
+                    states[q].pattern,
+                    token,
+                    py_predicates
+                )
             action = get_action(states[q], token.c, extra_attrs,
                                 cached_py_predicates)
         # Update alignment before the transition of current state
@@ -461,8 +505,12 @@ cdef void transition_states(vector[PatternStateC]& states, vector[MatchC]& match
             ent_id = get_ent_id(state.pattern)
             if action == MATCH:
                 matches.push_back(
-                    MatchC(pattern_id=ent_id, start=state.start,
-                            length=state.length+1))
+                    MatchC(
+                        pattern_id=ent_id,
+                        start=state.start,
+                        length=state.length+1
+                    )
+                )
                 # `align_matches` always corresponds to `matches` 1:1
                 if with_alignments != 0:
                     align_matches.push_back(align_states[q])
@@ -470,23 +518,35 @@ cdef void transition_states(vector[PatternStateC]& states, vector[MatchC]& match
                 # push match without last token if length > 0
                 if state.length > 0:
                     matches.push_back(
-                        MatchC(pattern_id=ent_id, start=state.start,
-                                length=state.length))
+                        MatchC(
+                            pattern_id=ent_id,
+                            start=state.start,
+                            length=state.length
+                        )
+                    )
                     # MATCH_DOUBLE emits matches twice,
                     # add one more to align_matches in order to keep 1:1 relationship
                     if with_alignments != 0:
                         align_matches.push_back(align_states[q])
                 # push match with last token
                 matches.push_back(
-                    MatchC(pattern_id=ent_id, start=state.start,
-                            length=state.length+1))
+                    MatchC(
+                        pattern_id=ent_id,
+                        start=state.start,
+                        length=state.length + 1
+                    )
+                )
                 # `align_matches` always corresponds to `matches` 1:1
                 if with_alignments != 0:
                     align_matches.push_back(align_states[q])
             elif action == MATCH_REJECT:
                 matches.push_back(
-                    MatchC(pattern_id=ent_id, start=state.start,
-                            length=state.length))
+                    MatchC(
+                        pattern_id=ent_id,
+                        start=state.start,
+                        length=state.length
+                    )
+                )
                 # `align_matches` always corresponds to `matches` 1:1
                 if with_alignments != 0:
                     align_matches.push_back(align_states[q])
@@ -509,8 +569,12 @@ cdef void transition_states(vector[PatternStateC]& states, vector[MatchC]& match
             align_states.push_back(align_new_states[i])
 
 
-cdef int update_predicate_cache(int8_t* cache,
-        const TokenPatternC* pattern, Token token, predicates) except -1:
+cdef int update_predicate_cache(
+    int8_t* cache,
+    const TokenPatternC* pattern,
+    Token token,
+    predicates
+) except -1:
     # If the state references any extra predicates, check whether they match.
     # These are cached, so that we don't call these potentially expensive
     # Python functions more than we need to.
@@ -556,10 +620,12 @@ cdef void finish_states(vector[MatchC]& matches, vector[PatternStateC]& states,
             else:
                 state.pattern += 1
 
-
-cdef action_t get_action(PatternStateC state,
-        const TokenC* token, const attr_t* extra_attrs,
-        const int8_t* predicate_matches) nogil:
+cdef action_t get_action(
+    PatternStateC state,
+    const TokenC * token,
+    const attr_t * extra_attrs,
+    const int8_t * predicate_matches
+) nogil:
     """We need to consider:
     a) Does the token match the specification? [Yes, No]
     b) What's the quantifier? [1, 0+, ?]
@@ -625,53 +691,56 @@ cdef action_t get_action(PatternStateC state,
         is_match = not is_match
         quantifier = ONE
     if quantifier == ONE:
-      if is_match and is_final:
-          # Yes, final: 1000
-          return MATCH
-      elif is_match and not is_final:
-          # Yes, non-final: 0100
-          return ADVANCE
-      elif not is_match and is_final:
-          # No, final: 0000
-          return REJECT
-      else:
-          return REJECT
+        if is_match and is_final:
+            # Yes, final: 1000
+            return MATCH
+        elif is_match and not is_final:
+            # Yes, non-final: 0100
+            return ADVANCE
+        elif not is_match and is_final:
+            # No, final: 0000
+            return REJECT
+        else:
+            return REJECT
     elif quantifier == ZERO_PLUS:
-      if is_match and is_final:
-          # Yes, final: 1001
-          return MATCH_EXTEND
-      elif is_match and not is_final:
-          # Yes, non-final: 0011
-          return RETRY_EXTEND
-      elif not is_match and is_final:
-          # No, final 2000 (note: Don't include last token!)
-          return MATCH_REJECT
-      else:
-          # No, non-final 0010
-          return RETRY
+        if is_match and is_final:
+            # Yes, final: 1001
+            return MATCH_EXTEND
+        elif is_match and not is_final:
+            # Yes, non-final: 0011
+            return RETRY_EXTEND
+        elif not is_match and is_final:
+            # No, final 2000 (note: Don't include last token!)
+            return MATCH_REJECT
+        else:
+            # No, non-final 0010
+            return RETRY
     elif quantifier == ZERO_ONE:
-      if is_match and is_final:
-          # Yes, final: 3000
-          # To cater for a pattern ending in "?", we need to add
-          # a match both with and without the last token
-          return MATCH_DOUBLE
-      elif is_match and not is_final:
-          # Yes, non-final: 0110
-          # We need both branches here, consider a pair like:
-          # pattern: .?b string: b
-          # If we 'ADVANCE' on the .?, we miss the match.
-          return RETRY_ADVANCE
-      elif not is_match and is_final:
-          # No, final 2000 (note: Don't include last token!)
-          return MATCH_REJECT
-      else:
-          # No, non-final 0010
-          return RETRY
+        if is_match and is_final:
+            # Yes, final: 3000
+            # To cater for a pattern ending in "?", we need to add
+            # a match both with and without the last token
+            return MATCH_DOUBLE
+        elif is_match and not is_final:
+            # Yes, non-final: 0110
+            # We need both branches here, consider a pair like:
+            # pattern: .?b string: b
+            # If we 'ADVANCE' on the .?, we miss the match.
+            return RETRY_ADVANCE
+        elif not is_match and is_final:
+            # No, final 2000 (note: Don't include last token!)
+            return MATCH_REJECT
+        else:
+            # No, non-final 0010
+            return RETRY
 
 
-cdef int8_t get_is_match(PatternStateC state,
-        const TokenC* token, const attr_t* extra_attrs,
-        const int8_t* predicate_matches) nogil:
+cdef int8_t get_is_match(
+    PatternStateC state,
+    const TokenC* token,
+    const attr_t* extra_attrs,
+    const int8_t* predicate_matches
+) nogil:
     for i in range(state.pattern.nr_py):
         if predicate_matches[state.pattern.py_predicates[i]] == -1:
             return 0
@@ -686,18 +755,14 @@ cdef int8_t get_is_match(PatternStateC state,
     return True
 
 
-cdef int8_t get_is_final(PatternStateC state) nogil:
+cdef inline int8_t get_is_final(PatternStateC state) nogil:
     if state.pattern[1].quantifier == FINAL_ID:
-        id_attr = state.pattern[1].attrs[0]
-        if id_attr.attr != ID:
-            with gil:
-                raise ValueError(Errors.E074.format(attr=ID, bad_attr=id_attr.attr))
         return 1
     else:
         return 0
 
 
-cdef int8_t get_quantifier(PatternStateC state) nogil:
+cdef inline int8_t get_quantifier(PatternStateC state) nogil:
     return state.pattern.quantifier
 
 
@@ -750,7 +815,7 @@ cdef attr_t get_ent_id(const TokenPatternC* pattern) nogil:
     return id_attr.value
 
 
-def _preprocess_pattern(token_specs, vocab, extensions_table, extra_predicates):
+def _preprocess_pattern(token_specs, vocab, extensions_table, extra_predicates, fuzzy_compare):
     """This function interprets the pattern, converting the various bits of
     syntactic sugar before we compile it into a struct with init_pattern.
 
@@ -777,7 +842,7 @@ def _preprocess_pattern(token_specs, vocab, extensions_table, extra_predicates):
         ops = _get_operators(spec)
         attr_values = _get_attr_values(spec, string_store)
         extensions = _get_extensions(spec, string_store, extensions_table)
-        predicates = _get_extra_predicates(spec, extra_predicates, vocab)
+        predicates = _get_extra_predicates(spec, extra_predicates, vocab, fuzzy_compare)
         for op in ops:
             tokens.append((op, list(attr_values), list(extensions), list(predicates), token_idx))
     return tokens
@@ -786,6 +851,7 @@ def _preprocess_pattern(token_specs, vocab, extensions_table, extra_predicates):
 def _get_attr_values(spec, string_store):
     attr_values = []
     for attr, value in spec.items():
+        input_attr = attr
         if isinstance(attr, str):
             attr = attr.upper()
             if attr == '_':
@@ -814,23 +880,57 @@ def _get_attr_values(spec, string_store):
             attr_values.append((attr, value))
         else:
             # should be caught in validation
-            raise ValueError(Errors.E152.format(attr=attr))
+            raise ValueError(Errors.E152.format(attr=input_attr))
     return attr_values
+
+
+def _predicate_cache_key(attr, predicate, value, *, regex=False, fuzzy=None):
+    # tuple order affects performance
+    return (attr, regex, fuzzy, predicate, srsly.json_dumps(value, sort_keys=True))
 
 
 # These predicate helper classes are used to match the REGEX, IN, >= etc
 # extensions to the matcher introduced in #3173.
 
+class _FuzzyPredicate:
+    operators = ("FUZZY", "FUZZY1", "FUZZY2", "FUZZY3", "FUZZY4", "FUZZY5",
+                 "FUZZY6", "FUZZY7", "FUZZY8", "FUZZY9")
+
+    def __init__(self, i, attr, value, predicate, is_extension=False, vocab=None,
+                 regex=False, fuzzy=None, fuzzy_compare=None):
+        self.i = i
+        self.attr = attr
+        self.value = value
+        self.predicate = predicate
+        self.is_extension = is_extension
+        if self.predicate not in self.operators:
+            raise ValueError(Errors.E126.format(good=self.operators, bad=self.predicate))
+        fuzz = self.predicate[len("FUZZY"):]  # number after prefix
+        self.fuzzy = int(fuzz) if fuzz else -1
+        self.fuzzy_compare = fuzzy_compare
+        self.key = _predicate_cache_key(self.attr, self.predicate, value, fuzzy=self.fuzzy)
+
+    def __call__(self, Token token):
+        if self.is_extension:
+            value = token._.get(self.attr)
+        else:
+            value = token.vocab.strings[get_token_attr_for_matcher(token.c, self.attr)]
+        if self.value == value:
+            return True
+        return self.fuzzy_compare(value, self.value, self.fuzzy)
+
+
 class _RegexPredicate:
     operators = ("REGEX",)
 
-    def __init__(self, i, attr, value, predicate, is_extension=False, vocab=None):
+    def __init__(self, i, attr, value, predicate, is_extension=False, vocab=None,
+                 regex=False, fuzzy=None, fuzzy_compare=None):
         self.i = i
         self.attr = attr
         self.value = re.compile(value)
         self.predicate = predicate
         self.is_extension = is_extension
-        self.key = (attr, self.predicate, srsly.json_dumps(value, sort_keys=True))
+        self.key = _predicate_cache_key(self.attr, self.predicate, value)
         if self.predicate not in self.operators:
             raise ValueError(Errors.E126.format(good=self.operators, bad=self.predicate))
 
@@ -845,41 +945,78 @@ class _RegexPredicate:
 class _SetPredicate:
     operators = ("IN", "NOT_IN", "IS_SUBSET", "IS_SUPERSET", "INTERSECTS")
 
-    def __init__(self, i, attr, value, predicate, is_extension=False, vocab=None):
+    def __init__(self, i, attr, value, predicate, is_extension=False, vocab=None,
+                 regex=False, fuzzy=None, fuzzy_compare=None):
         self.i = i
         self.attr = attr
         self.vocab = vocab
+        self.regex = regex
+        self.fuzzy = fuzzy
+        self.fuzzy_compare = fuzzy_compare
         if self.attr == MORPH:
             # normalize morph strings
             self.value = set(self.vocab.morphology.add(v) for v in value)
         else:
-            self.value = set(get_string_id(v) for v in value)
+            if self.regex:
+                self.value = set(re.compile(v) for v in value)
+            elif self.fuzzy is not None:
+                # add to string store
+                self.value = set(self.vocab.strings.add(v) for v in value)
+            else:
+                self.value = set(get_string_id(v) for v in value)
         self.predicate = predicate
         self.is_extension = is_extension
-        self.key = (attr, self.predicate, srsly.json_dumps(value, sort_keys=True))
+        self.key = _predicate_cache_key(self.attr, self.predicate, value, regex=self.regex, fuzzy=self.fuzzy)
         if self.predicate not in self.operators:
             raise ValueError(Errors.E126.format(good=self.operators, bad=self.predicate))
 
     def __call__(self, Token token):
         if self.is_extension:
-            value = get_string_id(token._.get(self.attr))
+            value = token._.get(self.attr)
         else:
             value = get_token_attr_for_matcher(token.c, self.attr)
 
-        if self.predicate in ("IS_SUBSET", "IS_SUPERSET", "INTERSECTS"):
+        if self.predicate in ("IN", "NOT_IN"):
+            if isinstance(value, (str, int)):
+                value = get_string_id(value)
+            else:
+                return False
+        elif self.predicate in ("IS_SUBSET", "IS_SUPERSET", "INTERSECTS"):
+            # ensure that all values are enclosed in a set
             if self.attr == MORPH:
                 # break up MORPH into individual Feat=Val values
                 value = set(get_string_id(v) for v in MorphAnalysis.from_id(self.vocab, value))
+            elif isinstance(value, (str, int)):
+                value = set((get_string_id(value),))
+            elif isinstance(value, Iterable) and all(isinstance(v, (str, int)) for v in value):
+                value = set(get_string_id(v) for v in value)
             else:
-                # treat a single value as a list
-                if isinstance(value, (str, int)):
-                    value = set([get_string_id(value)])
-                else:
-                    value = set(get_string_id(v) for v in value)
+                return False
+
         if self.predicate == "IN":
-            return value in self.value
+            if self.regex:
+                value = self.vocab.strings[value]
+                return any(bool(v.search(value)) for v in self.value)
+            elif self.fuzzy is not None:
+                value = self.vocab.strings[value]
+                return any(self.fuzzy_compare(value, self.vocab.strings[v], self.fuzzy)
+                           for v in self.value)
+            elif value in self.value:
+                return True
+            else:
+                return False
         elif self.predicate == "NOT_IN":
-            return value not in self.value
+            if self.regex:
+                value = self.vocab.strings[value]
+                return not any(bool(v.search(value)) for v in self.value)
+            elif self.fuzzy is not None:
+                value = self.vocab.strings[value]
+                return not any(self.fuzzy_compare(value, self.vocab.strings[v], self.fuzzy)
+                               for v in self.value)
+            elif value in self.value:
+                return False
+            else:
+                return True
         elif self.predicate == "IS_SUBSET":
             return value <= self.value
         elif self.predicate == "IS_SUPERSET":
@@ -894,13 +1031,14 @@ class _SetPredicate:
 class _ComparisonPredicate:
     operators = ("==", "!=", ">=", "<=", ">", "<")
 
-    def __init__(self, i, attr, value, predicate, is_extension=False, vocab=None):
+    def __init__(self, i, attr, value, predicate, is_extension=False, vocab=None,
+                 regex=False, fuzzy=None, fuzzy_compare=None):
         self.i = i
         self.attr = attr
         self.value = value
         self.predicate = predicate
         self.is_extension = is_extension
-        self.key = (attr, self.predicate, srsly.json_dumps(value, sort_keys=True))
+        self.key = _predicate_cache_key(self.attr, self.predicate, value)
         if self.predicate not in self.operators:
             raise ValueError(Errors.E126.format(good=self.operators, bad=self.predicate))
 
@@ -923,7 +1061,7 @@ class _ComparisonPredicate:
             return value < self.value
 
 
-def _get_extra_predicates(spec, extra_predicates, vocab):
+def _get_extra_predicates(spec, extra_predicates, vocab, fuzzy_compare):
     predicate_types = {
         "REGEX": _RegexPredicate,
         "IN": _SetPredicate,
@@ -937,6 +1075,16 @@ def _get_extra_predicates(spec, extra_predicates, vocab):
         "<=": _ComparisonPredicate,
         ">": _ComparisonPredicate,
         "<": _ComparisonPredicate,
+        "FUZZY": _FuzzyPredicate,
+        "FUZZY1": _FuzzyPredicate,
+        "FUZZY2": _FuzzyPredicate,
+        "FUZZY3": _FuzzyPredicate,
+        "FUZZY4": _FuzzyPredicate,
+        "FUZZY5": _FuzzyPredicate,
+        "FUZZY6": _FuzzyPredicate,
+        "FUZZY7": _FuzzyPredicate,
+        "FUZZY8": _FuzzyPredicate,
+        "FUZZY9": _FuzzyPredicate,
     }
     seen_predicates = {pred.key: pred.i for pred in extra_predicates}
     output = []
@@ -954,33 +1102,59 @@ def _get_extra_predicates(spec, extra_predicates, vocab):
                 attr = "ORTH"
             attr = IDS.get(attr.upper())
         if isinstance(value, dict):
-            processed = False
-            value_with_upper_keys = {k.upper(): v for k, v in value.items()}
-            for type_, cls in predicate_types.items():
-                if type_ in value_with_upper_keys:
-                    predicate = cls(len(extra_predicates), attr, value_with_upper_keys[type_], type_, vocab=vocab)
-                    # Don't create a redundant predicates.
-                    # This helps with efficiency, as we're caching the results.
-                    if predicate.key in seen_predicates:
-                        output.append(seen_predicates[predicate.key])
-                    else:
-                        extra_predicates.append(predicate)
-                        output.append(predicate.i)
-                        seen_predicates[predicate.key] = predicate.i
-                    processed = True
-            if not processed:
-                warnings.warn(Warnings.W035.format(pattern=value))
+            output.extend(_get_extra_predicates_dict(attr, value, vocab, predicate_types,
+                                                     extra_predicates, seen_predicates, fuzzy_compare=fuzzy_compare))
     return output
 
 
-def _get_extension_extra_predicates(spec, extra_predicates, predicate_types,
-        seen_predicates):
+def _get_extra_predicates_dict(attr, value_dict, vocab, predicate_types,
+                               extra_predicates, seen_predicates, regex=False, fuzzy=None, fuzzy_compare=None):
+    output = []
+    for type_, value in value_dict.items():
+        type_ = type_.upper()
+        cls = predicate_types.get(type_)
+        if cls is None:
+            warnings.warn(Warnings.W035.format(pattern=value_dict))
+            # ignore unrecognized predicate type
+            continue
+        elif cls == _RegexPredicate:
+            if isinstance(value, dict):
+                # add predicates inside regex operator
+                output.extend(_get_extra_predicates_dict(attr, value, vocab, predicate_types,
+                                                         extra_predicates, seen_predicates,
+                                                         regex=True))
+                continue
+        elif cls == _FuzzyPredicate:
+            if isinstance(value, dict):
+                # add predicates inside fuzzy operator
+                fuzz = type_[len("FUZZY"):]  # number after prefix
+                fuzzy_val = int(fuzz) if fuzz else -1
+                output.extend(_get_extra_predicates_dict(attr, value, vocab, predicate_types,
+                                                         extra_predicates, seen_predicates,
+                                                         fuzzy=fuzzy_val, fuzzy_compare=fuzzy_compare))
+                continue
+        predicate = cls(len(extra_predicates), attr, value, type_, vocab=vocab,
+                        regex=regex, fuzzy=fuzzy, fuzzy_compare=fuzzy_compare)
+        # Don't create redundant predicates.
+        # This helps with efficiency, as we're caching the results.
+        if predicate.key in seen_predicates:
+            output.append(seen_predicates[predicate.key])
+        else:
+            extra_predicates.append(predicate)
+            output.append(predicate.i)
+            seen_predicates[predicate.key] = predicate.i
+    return output
+
+
+def _get_extension_extra_predicates(
+    spec, extra_predicates, predicate_types, seen_predicates
+):
     output = []
     for attr, value in spec.items():
         if isinstance(value, dict):
             for type_, cls in predicate_types.items():
                 if type_ in value:
-                    key = (attr, type_, srsly.json_dumps(value[type_], sort_keys=True))
+                    key = _predicate_cache_key(attr, type_, value[type_])
                     if key in seen_predicates:
                         output.append(seen_predicates[key])
                     else:
@@ -1003,8 +1177,29 @@ def _get_operators(spec):
         return (ONE,)
     elif spec["OP"] in lookup:
         return lookup[spec["OP"]]
+    # Min_max {n,m}
+    elif spec["OP"].startswith("{") and spec["OP"].endswith("}"):
+        # {n}  --> {n,n}  exactly n                 ONE,(n)
+        # {n,m}--> {n,m}  min of n, max of m        ONE,(n),ZERO_ONE,(m)
+        # {,m} --> {0,m}  min of zero, max of m     ZERO_ONE,(m)
+        # {n,} --> {n,∞} min of n, max of inf       ONE,(n),ZERO_PLUS
+
+        min_max = spec["OP"][1:-1]
+        min_max = min_max if "," in min_max else f"{min_max},{min_max}"
+        n, m = min_max.split(",")
+
+        # 1. Either n or m is a blank string and the other is numeric -->isdigit
+        # 2. Both are numeric and n <= m
+        if (not n.isdecimal() and not m.isdecimal()) or (n.isdecimal() and m.isdecimal() and int(n) > int(m)):
+            keys = ", ".join(lookup.keys()) + ", {n}, {n,m}, {n,}, {,m} where n and m are integers and n <= m "
+            raise ValueError(Errors.E011.format(op=spec["OP"], opts=keys))
+
+        # if n is empty string, zero would be used
+        head = tuple(ONE for __ in range(int(n or 0)))
+        tail = tuple(ZERO_ONE for __ in range(int(m) - int(n or 0))) if m else (ZERO_PLUS,)
+        return head + tail
     else:
-        keys = ", ".join(lookup.keys())
+        keys = ", ".join(lookup.keys()) + ", {n}, {n,m}, {n,}, {,m} where n and m are integers and n <= m "
         raise ValueError(Errors.E011.format(op=spec["OP"], opts=keys))
 
 

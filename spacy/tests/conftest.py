@@ -1,5 +1,12 @@
 import pytest
+from hypothesis import settings
+
 from spacy.util import get_lang_class
+
+# Functionally disable deadline settings for tests
+# to prevent spurious test failures in CI builds.
+settings.register_profile("no_deadlines", deadline=2 * 60 * 1000)  # in ms
+settings.load_profile("no_deadlines")
 
 
 def pytest_addoption(parser):
@@ -75,6 +82,11 @@ def bn_tokenizer():
 
 
 @pytest.fixture(scope="session")
+def bo_tokenizer():
+    return get_lang_class("bo")().tokenizer
+
+
+@pytest.fixture(scope="session")
 def ca_tokenizer():
     return get_lang_class("ca")().tokenizer
 
@@ -97,6 +109,11 @@ def de_tokenizer():
 @pytest.fixture(scope="session")
 def de_vocab():
     return get_lang_class("de")().vocab
+
+
+@pytest.fixture(scope="session")
+def dsb_tokenizer():
+    return get_lang_class("dsb")().tokenizer
 
 
 @pytest.fixture(scope="session")
@@ -151,8 +168,18 @@ def fi_tokenizer():
 
 
 @pytest.fixture(scope="session")
+def fo_tokenizer():
+    return get_lang_class("fo")().tokenizer
+
+
+@pytest.fixture(scope="session")
 def fr_tokenizer():
     return get_lang_class("fr")().tokenizer
+
+
+@pytest.fixture(scope="session")
+def fr_vocab():
+    return get_lang_class("fr")().vocab
 
 
 @pytest.fixture(scope="session")
@@ -206,9 +233,19 @@ def it_tokenizer():
 
 
 @pytest.fixture(scope="session")
+def it_vocab():
+    return get_lang_class("it")().vocab
+
+
+@pytest.fixture(scope="session")
 def ja_tokenizer():
     pytest.importorskip("sudachipy")
     return get_lang_class("ja")().tokenizer
+
+
+@pytest.fixture(scope="session")
+def hsb_tokenizer():
+    return get_lang_class("hsb")().tokenizer
 
 
 @pytest.fixture(scope="session")
@@ -218,8 +255,31 @@ def ko_tokenizer():
 
 
 @pytest.fixture(scope="session")
+def ko_tokenizer_tokenizer():
+    config = {
+        "nlp": {
+            "tokenizer": {
+                "@tokenizers": "spacy.Tokenizer.v1",
+            }
+        }
+    }
+    nlp = get_lang_class("ko").from_config(config)
+    return nlp.tokenizer
+
+
+@pytest.fixture(scope="module")
+def la_tokenizer():
+    return get_lang_class("la")().tokenizer
+
+
+@pytest.fixture(scope="session")
 def lb_tokenizer():
     return get_lang_class("lb")().tokenizer
+
+
+@pytest.fixture(scope="session")
+def lg_tokenizer():
+    return get_lang_class("lg")().tokenizer
 
 
 @pytest.fixture(scope="session")
@@ -243,6 +303,11 @@ def ml_tokenizer():
 
 
 @pytest.fixture(scope="session")
+def ms_tokenizer():
+    return get_lang_class("ms")().tokenizer
+
+
+@pytest.fixture(scope="session")
 def nb_tokenizer():
     return get_lang_class("nb")().tokenizer
 
@@ -260,6 +325,11 @@ def nl_vocab():
 @pytest.fixture(scope="session")
 def nl_tokenizer():
     return get_lang_class("nl")().tokenizer
+
+
+@pytest.fixture(scope="session")
+def nn_tokenizer():
+    return get_lang_class("nn")().tokenizer
 
 
 @pytest.fixture(scope="session")
@@ -284,14 +354,22 @@ def ro_tokenizer():
 
 @pytest.fixture(scope="session")
 def ru_tokenizer():
-    pytest.importorskip("pymorphy2")
+    pytest.importorskip("pymorphy3")
     return get_lang_class("ru")().tokenizer
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def ru_lemmatizer():
-    pytest.importorskip("pymorphy2")
+    pytest.importorskip("pymorphy3")
     return get_lang_class("ru")().add_pipe("lemmatizer")
+
+
+@pytest.fixture(scope="session")
+def ru_lookup_lemmatizer():
+    pytest.importorskip("pymorphy3")
+    return get_lang_class("ru")().add_pipe(
+        "lemmatizer", config={"mode": "pymorphy3_lookup"}
+    )
 
 
 @pytest.fixture(scope="session")
@@ -322,6 +400,11 @@ def sq_tokenizer():
 @pytest.fixture(scope="session")
 def sv_tokenizer():
     return get_lang_class("sv")().tokenizer
+
+
+@pytest.fixture(scope="session")
+def ta_tokenizer():
+    return get_lang_class("ta")().tokenizer
 
 
 @pytest.fixture(scope="session")
@@ -357,15 +440,24 @@ def ky_tokenizer():
 
 @pytest.fixture(scope="session")
 def uk_tokenizer():
-    pytest.importorskip("pymorphy2")
+    pytest.importorskip("pymorphy3")
     return get_lang_class("uk")().tokenizer
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def uk_lemmatizer():
-    pytest.importorskip("pymorphy2")
-    pytest.importorskip("pymorphy2_dicts_uk")
+    pytest.importorskip("pymorphy3")
+    pytest.importorskip("pymorphy3_dicts_uk")
     return get_lang_class("uk")().add_pipe("lemmatizer")
+
+
+@pytest.fixture(scope="session")
+def uk_lookup_lemmatizer():
+    pytest.importorskip("pymorphy3")
+    pytest.importorskip("pymorphy3_dicts_uk")
+    return get_lang_class("uk")().add_pipe(
+        "lemmatizer", config={"mode": "pymorphy3_lookup"}
+    )
 
 
 @pytest.fixture(scope="session")

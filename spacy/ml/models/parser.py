@@ -1,13 +1,14 @@
-from typing import Optional, List, cast
-from thinc.api import Model, chain, list2array, Linear, zero_init, use_ops
+from typing import List, Optional, cast
+
+from thinc.api import Linear, Model, chain, list2array, use_ops, zero_init
 from thinc.types import Floats2d
 
-from ...errors import Errors
 from ...compat import Literal
+from ...errors import Errors
+from ...tokens import Doc
 from ...util import registry
 from .._precomputable_affine import PrecomputableAffine
 from ..tb_framework import TransitionModel
-from ...tokens import Doc
 
 
 @registry.architectures("spacy.TransitionBasedParser.v2")
@@ -72,7 +73,7 @@ def build_tb_parser_model(
     t2v_width = tok2vec.get_dim("nO") if tok2vec.has_dim("nO") else None
     tok2vec = chain(
         tok2vec,
-        cast(Model[List["Floats2d"], Floats2d], list2array()),
+        list2array(),
         Linear(hidden_width, t2v_width),
     )
     tok2vec.set_dim("nO", hidden_width)

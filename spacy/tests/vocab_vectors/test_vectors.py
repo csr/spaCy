@@ -318,17 +318,15 @@ def test_vectors_lexeme_doc_similarity(vocab, text):
 @pytest.mark.parametrize("text", [["apple", "orange", "juice"]])
 def test_vectors_span_span_similarity(vocab, text):
     doc = Doc(vocab, words=text)
-    with pytest.warns(UserWarning):
-        assert doc[0:2].similarity(doc[1:3]) == doc[1:3].similarity(doc[0:2])
-        assert -1.0 < doc[0:2].similarity(doc[1:3]) < 1.0
+    assert doc[0:2].similarity(doc[1:3]) == doc[1:3].similarity(doc[0:2])
+    assert -1.0 < doc[0:2].similarity(doc[1:3]) < 1.0
 
 
 @pytest.mark.parametrize("text", [["apple", "orange", "juice"]])
 def test_vectors_span_doc_similarity(vocab, text):
     doc = Doc(vocab, words=text)
-    with pytest.warns(UserWarning):
-        assert doc[0:2].similarity(doc) == doc.similarity(doc[0:2])
-        assert -1.0 < doc[0:2].similarity(doc) < 1.0
+    assert doc[0:2].similarity(doc) == doc.similarity(doc[0:2])
+    assert -1.0 < doc[0:2].similarity(doc) < 1.0
 
 
 @pytest.mark.parametrize(
@@ -404,6 +402,7 @@ def test_vectors_serialize():
         row_r = v_r.add("D", vector=OPS.asarray([10, 20, 30, 40], dtype="f"))
         assert row == row_r
         assert_equal(OPS.to_numpy(v.data), OPS.to_numpy(v_r.data))
+        assert v.attr == v_r.attr
 
 
 def test_vector_is_oov():
@@ -453,6 +452,39 @@ def test_vectors_get_batch():
     rows = v.find(keys=words)
     vecs = OPS.as_contig(v.data[rows])
     assert_equal(OPS.to_numpy(vecs), OPS.to_numpy(v.get_batch(words)))
+
+
+def test_vectors_deduplicate():
+    data = OPS.asarray([[1, 1], [2, 2], [3, 4], [1, 1], [3, 4]], dtype="f")
+    v = Vectors(data=data, keys=["a1", "b1", "c1", "a2", "c2"])
+    vocab = Vocab()
+    vocab.vectors = v
+    # duplicate vectors do not use the same keys
+    assert (
+        vocab.vectors.key2row[v.strings["a1"]] != vocab.vectors.key2row[v.strings["a2"]]
+    )
+    assert (
+        vocab.vectors.key2row[v.strings["c1"]] != vocab.vectors.key2row[v.strings["c2"]]
+    )
+    vocab.deduplicate_vectors()
+    # there are three unique vectors
+    assert vocab.vectors.shape[0] == 3
+    # the uniqued data is the same as the deduplicated data
+    assert_equal(
+        numpy.unique(OPS.to_numpy(vocab.vectors.data), axis=0),
+        OPS.to_numpy(vocab.vectors.data),
+    )
+    # duplicate vectors use the same keys now
+    assert (
+        vocab.vectors.key2row[v.strings["a1"]] == vocab.vectors.key2row[v.strings["a2"]]
+    )
+    assert (
+        vocab.vectors.key2row[v.strings["c1"]] == vocab.vectors.key2row[v.strings["c2"]]
+    )
+    # deduplicating again makes no changes
+    vocab_b = vocab.to_bytes()
+    vocab.deduplicate_vectors()
+    assert vocab_b == vocab.to_bytes()
 
 
 @pytest.fixture()
@@ -535,6 +567,10 @@ def test_floret_vectors(floret_vectors_vec_str, floret_vectors_hashvec_str):
         # every word has a vector
         assert nlp.vocab[word * 5].has_vector
 
+    # n_keys is -1 for floret
+    assert nlp_plain.vocab.vectors.n_keys > 0
+    assert nlp.vocab.vectors.n_keys == -1
+
     # check that single and batched vector lookups are identical
     words = [s for s in nlp_plain.vocab.vectors]
     single_vecs = OPS.to_numpy(OPS.asarray([nlp.vocab[word].vector for word in words]))
@@ -591,3 +627,52 @@ def test_floret_vectors(floret_vectors_vec_str, floret_vectors_hashvec_str):
             OPS.to_numpy(vocab_r[word].vector),
             decimal=6,
         )
+
+
+def test_equality():
+    vectors1 = Vectors(shape=(10, 10))
+    vectors2 = Vectors(shape=(10, 8))
+
+    assert vectors1 != vectors2
+
+    vectors2 = Vectors(shape=(10, 10))
+    assert vectors1 == vectors2
+
+    vectors1.add("hello", row=2)
+    assert vectors1 != vectors2
+
+    vectors2.add("hello", row=2)
+    assert vectors1 == vectors2
+
+    vectors1.resize((5, 9))
+    vectors2.resize((5, 9))
+    assert vectors1 == vectors2
+
+
+def test_vectors_attr():
+    data = numpy.asarray([[0, 0, 0], [1, 2, 3], [9, 8, 7]], dtype="f")
+    # default ORTH
+    nlp = English()
+    nlp.vocab.vectors = Vectors(data=data, keys=["A", "B", "C"])
+    assert nlp.vocab.strings["A"] in nlp.vocab.vectors.key2row
+    assert nlp.vocab.strings["a"] not in nlp.vocab.vectors.key2row
+    assert nlp.vocab["A"].has_vector is True
+    assert nlp.vocab["a"].has_vector is False
+    assert nlp("A")[0].has_vector is True
+    assert nlp("a")[0].has_vector is False
+
+    # custom LOWER
+    nlp = English()
+    nlp.vocab.vectors = Vectors(data=data, keys=["a", "b", "c"], attr="LOWER")
+    assert nlp.vocab.strings["A"] not in nlp.vocab.vectors.key2row
+    assert nlp.vocab.strings["a"] in nlp.vocab.vectors.key2row
+    assert nlp.vocab["A"].has_vector is True
+    assert nlp.vocab["a"].has_vector is True
+    assert nlp("A")[0].has_vector is True
+    assert nlp("a")[0].has_vector is True
+    # add a new vectors entry
+    assert nlp.vocab["D"].has_vector is False
+    assert nlp.vocab["d"].has_vector is False
+    nlp.vocab.set_vector("D", numpy.asarray([4, 5, 6]))
+    assert nlp.vocab["D"].has_vector is True
+    assert nlp.vocab["d"].has_vector is True

@@ -1,13 +1,13 @@
-from typing import Any, List, Union, Optional, Dict
+from collections import OrderedDict
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
 import srsly
 from preshed.bloom import BloomFilter
-from collections import OrderedDict
 
 from .errors import Errors
-from .util import SimpleFrozenDict, ensure_path, registry, load_language_data
 from .strings import get_string_id
-
+from .util import SimpleFrozenDict, ensure_path, load_language_data, registry
 
 UNSET = object()
 
@@ -85,7 +85,7 @@ class Table(OrderedDict):
         value: The value to set.
         """
         key = get_string_id(key)
-        OrderedDict.__setitem__(self, key, value)
+        OrderedDict.__setitem__(self, key, value)  # type:ignore[assignment]
         self.bloom.add(key)
 
     def set(self, key: Union[str, int], value: Any) -> None:
@@ -104,7 +104,7 @@ class Table(OrderedDict):
         RETURNS: The value.
         """
         key = get_string_id(key)
-        return OrderedDict.__getitem__(self, key)
+        return OrderedDict.__getitem__(self, key)  # type:ignore[index]
 
     def get(self, key: Union[str, int], default: Optional[Any] = None) -> Any:
         """Get the value for a given key. String keys will be hashed.
@@ -114,7 +114,7 @@ class Table(OrderedDict):
         RETURNS: The value.
         """
         key = get_string_id(key)
-        return OrderedDict.get(self, key, default)
+        return OrderedDict.get(self, key, default)  # type:ignore[arg-type]
 
     def __contains__(self, key: Union[str, int]) -> bool:  # type: ignore[override]
         """Check whether a key is in the table. String keys will be hashed.

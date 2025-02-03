@@ -1,7 +1,7 @@
 .pre
     position: relative
     background: var(--color-front)
-    color: var(--color-subtle)
+    color: var(--color-subtle-on-dark)
     border-radius: var(--border-radius)
     overflow: auto
     width: 100%
@@ -56,7 +56,7 @@
     --color-inline-code-text: var(--color-back)
     --color-inline-code-bg: var(--color-dark-secondary)
 
-.type-annotation,
+.type-annotation
     white-space: pre-wrap
     font-family: var(--font-code)
 
@@ -109,6 +109,8 @@
     box-shadow: inset 1px 1px 1px rgba(0, 0, 0, 0.25)
     background: var(--color-dark)
     margin: 1.5rem 0 0 2rem
+    position: sticky
+    left: 2rem
 
 .header
     width: 100%
@@ -152,7 +154,7 @@
 
 .juniper-button
     transition: background-color 0.15s ease
-    background: var(--color-theme)
+    background: var(--color-theme-dark)
     margin: 0.5rem 0 1rem 2rem
 
     &:hover
@@ -182,8 +184,8 @@
         color: inherit !important
 
 .cli-arg-highlight
-    background: var(--color-theme)
-    border-color: var(--color-theme)
+    background: var(--color-theme-dark)
+    border-color: var(--color-theme-dark)
     color: var(--color-back) !important
 
 .cli-arg-subtle

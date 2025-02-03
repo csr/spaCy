@@ -1,11 +1,14 @@
+from ...attrs import LANG
+from ...language import BaseDefaults, Language
+from ...util import update_exc
+from ..punctuation import (
+    COMBINING_DIACRITICS_TOKENIZER_INFIXES,
+    COMBINING_DIACRITICS_TOKENIZER_SUFFIXES,
+)
+from ..tokenizer_exceptions import BASE_EXCEPTIONS
+from .lex_attrs import LEX_ATTRS
 from .stop_words import STOP_WORDS
 from .tokenizer_exceptions import TOKENIZER_EXCEPTIONS
-from .lex_attrs import LEX_ATTRS
-from ..tokenizer_exceptions import BASE_EXCEPTIONS
-
-from ...language import Language, BaseDefaults
-from ...attrs import LANG
-from ...util import update_exc
 
 
 class BulgarianDefaults(BaseDefaults):
@@ -16,6 +19,8 @@ class BulgarianDefaults(BaseDefaults):
 
     stop_words = STOP_WORDS
     tokenizer_exceptions = update_exc(BASE_EXCEPTIONS, TOKENIZER_EXCEPTIONS)
+    suffixes = COMBINING_DIACRITICS_TOKENIZER_SUFFIXES
+    infixes = COMBINING_DIACRITICS_TOKENIZER_INFIXES
 
 
 class Bulgarian(Language):

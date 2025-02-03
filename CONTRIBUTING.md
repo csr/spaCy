@@ -35,7 +35,7 @@ so that more people can benefit from it.
 
 When opening an issue, use a **descriptive title** and include your
 **environment** (operating system, Python version, spaCy version). Our
-[issue template](https://github.com/explosion/spaCy/issues/new) helps you
+[issue templates](https://github.com/explosion/spaCy/issues/new/choose) help you
 remember the most important details to include. If you've discovered a bug, you
 can also submit a [regression test](#fixing-bugs) straight away. When you're
 opening an issue to report the bug, simply refer to your pull request in the
@@ -144,7 +144,7 @@ Changes to `.py` files will be effective immediately.
 
 When fixing a bug, first create an
 [issue](https://github.com/explosion/spaCy/issues) if one does not already
-exist.  The description text can be very short – we don't want to make this too
+exist. The description text can be very short – we don't want to make this too
 bureaucratic.
 
 Next, add a test to the relevant file in the
@@ -172,6 +172,11 @@ spaCy uses [`black`](https://github.com/ambv/black) for code
 formatting and [`flake8`](http://flake8.pycqa.org/en/latest/) for linting its
 Python modules. If you've built spaCy from source, you'll already have both
 tools installed.
+
+As a general rule of thumb, we use f-strings for any formatting of strings.
+One exception are calls to Python's `logging` functionality.
+To avoid unnecessary string conversions in these cases, we use string formatting
+templates with `%s` and `%d` etc.
 
 **⚠️ Note that formatting and linting is currently only possible for Python
 modules in `.py` files, not Cython modules in `.pyx` and `.pxd` files.**
@@ -233,7 +238,7 @@ also want to keep an eye on unused declared variables or repeated
 (i.e. overwritten) dictionary keys. If your code was formatted with `black`
 (see above), you shouldn't see any formatting-related warnings.
 
-The [`.flake8`](.flake8) config defines the configuration we use for this
+The `flake8` section in [`setup.cfg`](setup.cfg) defines the configuration we use for this
 codebase. For example, we're not super strict about the line length, and we're
 excluding very large files like lemmatization and tokenizer exception tables.
 
@@ -271,7 +276,8 @@ except:  # noqa: E722
 
 ### Python conventions
 
-All Python code must be written **compatible with Python 3.6+**.
+All Python code must be written **compatible with Python 3.6+**. More detailed
+code conventions can be found in the [developer docs](https://github.com/explosion/spaCy/blob/master/extra/DEVELOPER_DOCS/Code%20Conventions.md).
 
 #### I/O and handling paths
 
@@ -443,13 +449,12 @@ and plugins in spaCy v3.0, and we can't wait to see what you build with it!
   [`spacy`](https://github.com/topics/spacy?o=desc&s=stars) and
   [`spacy-extensions`](https://github.com/topics/spacy-extension?o=desc&s=stars)
   to make it easier to find. Those are also the topics we're linking to from the
-  spaCy website. If you're sharing your project on Twitter, feel free to tag
-  [@spacy_io](https://twitter.com/spacy_io) so we can check it out.
+  spaCy website. If you're sharing your project on X, feel free to tag
+  [@spacy_io](https://x.com/spacy_io) so we can check it out.
 
-- Once your extension is published, you can open an issue on the
-  [issue tracker](https://github.com/explosion/spacy/issues) to suggest it for the
-  [resources directory](https://spacy.io/usage/resources#extensions) on the
-  website.
+- Once your extension is published, you can open a
+  [PR](https://github.com/explosion/spaCy/pulls) to suggest it for the
+  [Universe](https://spacy.io/universe) page.
 
 📖 **For more tips and best practices, see the [checklist for developing spaCy extensions](https://spacy.io/usage/processing-pipelines#extensions).**
 

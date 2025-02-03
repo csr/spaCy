@@ -4,14 +4,13 @@ spaCy's built in visualization suite for dependencies and named entities.
 DOCS: https://spacy.io/api/top-level#displacy
 USAGE: https://spacy.io/usage/visualizers
 """
-from typing import Union, Iterable, Optional, Dict, Any, Callable
 import warnings
+from typing import Any, Callable, Dict, Iterable, Optional, Union
 
-from .render import DependencyRenderer, EntityRenderer
-from ..tokens import Doc, Span
 from ..errors import Errors, Warnings
-from ..util import is_in_jupyter
-
+from ..tokens import Doc, Span
+from ..util import find_available_port, is_in_jupyter
+from .render import DependencyRenderer, EntityRenderer, SpanRenderer
 
 _html = {}
 RENDER_WRAPPER = None
@@ -36,7 +35,7 @@ def render(
     jupyter (bool): Override Jupyter auto-detection.
     options (dict): Visualiser-specific options, e.g. colors.
     manual (bool): Don't parse `Doc` and instead expect a dict/list of dicts.
-    RETURNS (str): Rendered HTML markup.
+    RETURNS (str): Rendered SVG or HTML markup.
 
     DOCS: https://spacy.io/api/top-level#displacy.render
     USAGE: https://spacy.io/usage/visualizers
@@ -44,6 +43,7 @@ def render(
     factories = {
         "dep": (DependencyRenderer, parse_deps),
         "ent": (EntityRenderer, parse_ents),
+        "span": (SpanRenderer, parse_spans),
     }
     if style not in factories:
         raise ValueError(Errors.E087.format(style=style))
@@ -55,6 +55,10 @@ def render(
     renderer_func, converter = factories[style]
     renderer = renderer_func(options=options)
     parsed = [converter(doc, options) for doc in docs] if not manual else docs  # type: ignore
+    if manual:
+        for doc in docs:
+            if isinstance(doc, dict) and "ents" in doc:
+                doc["ents"] = sorted(doc["ents"], key=lambda x: (x["start"], x["end"]))
     _html["parsed"] = renderer.render(parsed, page=page, minify=minify).strip()  # type: ignore
     html = _html["parsed"]
     if RENDER_WRAPPER is not None:
@@ -62,7 +66,7 @@ def render(
     if jupyter or (jupyter is None and is_in_jupyter()):
         # return HTML rendered by IPython display()
         # See #4840 for details on span wrapper to disable mathjax
-        from IPython.core.display import display, HTML
+        from IPython.core.display import HTML, display
 
         return display(HTML('<span class="tex2jax_ignore">{}</span>'.format(html)))
     return html
@@ -77,6 +81,7 @@ def serve(
     manual: bool = False,
     port: int = 5000,
     host: str = "0.0.0.0",
+    auto_select_port: bool = False,
 ) -> None:
     """Serve displaCy visualisation.
 
@@ -88,11 +93,14 @@ def serve(
     manual (bool): Don't parse `Doc` and instead expect a dict/list of dicts.
     port (int): Port to serve visualisation.
     host (str): Host to serve visualisation.
+    auto_select_port (bool): Automatically select a port if the specified port is in use.
 
     DOCS: https://spacy.io/api/top-level#displacy.serve
     USAGE: https://spacy.io/usage/visualizers
     """
     from wsgiref import simple_server
+
+    port = find_available_port(port, host, auto_select_port)
 
     if is_in_jupyter():
         warnings.warn(Warnings.W011)
@@ -115,12 +123,17 @@ def app(environ, start_response):
     return [res]
 
 
-def parse_deps(orig_doc: Doc, options: Dict[str, Any] = {}) -> Dict[str, Any]:
+def parse_deps(
+    orig_doc: Union[Doc, Span], options: Dict[str, Any] = {}
+) -> Dict[str, Any]:
     """Generate dependency parse in {'words': [], 'arcs': []} format.
 
-    doc (Doc): Document do parse.
+    orig_doc (Union[Doc, Span]): Document to parse.
+    options (Dict[str, Any]): Dependency parse specific visualisation options.
     RETURNS (dict): Generated dependency parse keyed by words and arcs.
     """
+    if isinstance(orig_doc, Span):
+        orig_doc = orig_doc.as_doc()
     doc = Doc(orig_doc.vocab).from_bytes(
         orig_doc.to_bytes(exclude=["user_data", "user_hooks"])
     )
@@ -201,6 +214,43 @@ def parse_ents(doc: Doc, options: Dict[str, Any] = {}) -> Dict[str, Any]:
     title = doc.user_data.get("title", None) if hasattr(doc, "user_data") else None
     settings = get_doc_settings(doc)
     return {"text": doc.text, "ents": ents, "title": title, "settings": settings}
+
+
+def parse_spans(doc: Doc, options: Dict[str, Any] = {}) -> Dict[str, Any]:
+    """Generate spans in [{start_token: i, end_token: i, label: 'label'}] format.
+
+    doc (Doc): Document to parse.
+    options (Dict[str, any]): Span-specific visualisation options.
+    RETURNS (dict): Generated span types keyed by text (original text) and spans.
+    """
+    kb_url_template = options.get("kb_url_template", None)
+    spans_key = options.get("spans_key", "sc")
+    spans = [
+        {
+            "start": span.start_char,
+            "end": span.end_char,
+            "start_token": span.start,
+            "end_token": span.end,
+            "label": span.label_,
+            "kb_id": span.kb_id_ if span.kb_id_ else "",
+            "kb_url": kb_url_template.format(span.kb_id_) if kb_url_template else "#",
+        }
+        for span in doc.spans.get(spans_key, [])
+    ]
+    tokens = [token.text for token in doc]
+
+    if not spans:
+        keys = list(doc.spans.keys())
+        warnings.warn(Warnings.W117.format(spans_key=spans_key, keys=keys))
+    title = doc.user_data.get("title", None) if hasattr(doc, "user_data") else None
+    settings = get_doc_settings(doc)
+    return {
+        "text": doc.text,
+        "spans": spans,
+        "title": title,
+        "settings": settings,
+        "tokens": tokens,
+    }
 
 
 def set_render_wrapper(func: Callable[[str], str]) -> None:

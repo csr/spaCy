@@ -1,26 +1,49 @@
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
-from typing import cast, overload
-from pathlib import Path
-from collections import Counter
+import math
 import sys
-import srsly
-from wasabi import Printer, MESSAGES, msg
-import typer
+from collections import Counter
+from pathlib import Path
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+    cast,
+    overload,
+)
 
-from ._util import app, Arg, Opt, show_validation_error, parse_config_overrides
-from ._util import import_code, debug_cli
-from ..training import Example
-from ..training.initialize import get_sourced_components
-from ..schemas import ConfigSchemaTraining
+import numpy
+import srsly
+import typer
+from wasabi import MESSAGES, Printer, msg
+
+from .. import util
+from ..compat import Literal
+from ..language import Language
+from ..morphology import Morphology
+from ..pipeline import Morphologizer, SpanCategorizer, TrainablePipe
+from ..pipeline._edit_tree_internals.edit_trees import EditTrees
 from ..pipeline._parser_internals import nonproj
 from ..pipeline._parser_internals.nonproj import DELIMITER
-from ..pipeline import Morphologizer, SpanCategorizer
-from ..morphology import Morphology
-from ..language import Language
+from ..schemas import ConfigSchemaTraining
+from ..training import Example, remove_bilu_prefix
+from ..training.initialize import get_sourced_components
 from ..util import registry, resolve_dot_names
-from ..compat import Literal
-from .. import util
-
+from ..vectors import Mode as VectorsMode
+from ._util import (
+    Arg,
+    Opt,
+    _format_number,
+    app,
+    debug_cli,
+    import_code,
+    parse_config_overrides,
+    show_validation_error,
+)
 
 # Minimum number of expected occurrences of NER label in data to train new label
 NEW_LABEL_THRESHOLD = 50
@@ -29,6 +52,12 @@ DEP_LABEL_THRESHOLD = 20
 # Minimum number of expected examples to train a new pipeline
 BLANK_MODEL_MIN_THRESHOLD = 100
 BLANK_MODEL_THRESHOLD = 2000
+# Arbitrary threshold where SpanCat performs well
+SPAN_DISTINCT_THRESHOLD = 1
+# Arbitrary threshold where SpanCat performs well
+BOUNDARY_DISTINCT_THRESHOLD = 1
+# Arbitrary threshold for filtering span lengths during reporting (percentage)
+SPAN_LENGTH_THRESHOLD_PERCENTAGE = 90
 
 
 @debug_cli.command(
@@ -170,30 +199,38 @@ def debug_data(
         show=verbose,
     )
     if len(nlp.vocab.vectors):
-        msg.info(
-            f"{len(nlp.vocab.vectors)} vectors ({nlp.vocab.vectors.n_keys} "
-            f"unique keys, {nlp.vocab.vectors_length} dimensions)"
-        )
-        n_missing_vectors = sum(gold_train_data["words_missing_vectors"].values())
-        msg.warn(
-            "{} words in training data without vectors ({:.0f}%)".format(
-                n_missing_vectors,
-                100 * (n_missing_vectors / gold_train_data["n_words"]),
-            ),
-        )
-        msg.text(
-            "10 most common words without vectors: {}".format(
-                _format_labels(
-                    gold_train_data["words_missing_vectors"].most_common(10),
-                    counts=True,
-                )
-            ),
-            show=verbose,
-        )
+        if nlp.vocab.vectors.mode == VectorsMode.floret:
+            msg.info(
+                f"floret vectors with {len(nlp.vocab.vectors)} vectors, "
+                f"{nlp.vocab.vectors_length} dimensions, "
+                f"{nlp.vocab.vectors.minn}-{nlp.vocab.vectors.maxn} char "
+                f"n-gram subwords"
+            )
+        else:
+            msg.info(
+                f"{len(nlp.vocab.vectors)} vectors ({nlp.vocab.vectors.n_keys} "
+                f"unique keys, {nlp.vocab.vectors_length} dimensions)"
+            )
+            n_missing_vectors = sum(gold_train_data["words_missing_vectors"].values())
+            msg.warn(
+                "{} words in training data without vectors ({:.0f}%)".format(
+                    n_missing_vectors,
+                    100 * (n_missing_vectors / gold_train_data["n_words"]),
+                ),
+            )
+            msg.text(
+                "10 most common words without vectors: {}".format(
+                    _format_labels(
+                        gold_train_data["words_missing_vectors"].most_common(10),
+                        counts=True,
+                    )
+                ),
+                show=verbose,
+            )
     else:
         msg.info("No word vectors present in the package")
 
-    if "spancat" in factory_names:
+    if "spancat" in factory_names or "spancat_singlelabel" in factory_names:
         model_labels_spancat = _get_labels_from_spancat(nlp)
         has_low_data_warning = False
         has_no_neg_warning = False
@@ -238,6 +275,69 @@ def debug_data(
                     msg.warn(f"No examples for texts WITHOUT new label '{label}'")
                     has_no_neg_warning = True
 
+            with msg.loading("Obtaining span characteristics..."):
+                span_characteristics = _get_span_characteristics(
+                    train_dataset, gold_train_data, spans_key
+                )
+
+            msg.info(f"Span characteristics for spans_key '{spans_key}'")
+            msg.info("SD = Span Distinctiveness, BD = Boundary Distinctiveness")
+            _print_span_characteristics(span_characteristics)
+
+            _span_freqs = _get_spans_length_freq_dist(
+                gold_train_data["spans_length"][spans_key]
+            )
+            _filtered_span_freqs = _filter_spans_length_freq_dist(
+                _span_freqs, threshold=SPAN_LENGTH_THRESHOLD_PERCENTAGE
+            )
+
+            msg.info(
+                f"Over {SPAN_LENGTH_THRESHOLD_PERCENTAGE}% of spans have lengths of 1 -- "
+                f"{max(_filtered_span_freqs.keys())} "
+                f"(min={span_characteristics['min_length']}, max={span_characteristics['max_length']}). "
+                f"The most common span lengths are: {_format_freqs(_filtered_span_freqs)}. "
+                "If you are using the n-gram suggester, note that omitting "
+                "infrequent n-gram lengths can greatly improve speed and "
+                "memory usage."
+            )
+
+            msg.text(
+                f"Full distribution of span lengths: {_format_freqs(_span_freqs)}",
+                show=verbose,
+            )
+
+            # Add report regarding span characteristics
+            if span_characteristics["avg_sd"] < SPAN_DISTINCT_THRESHOLD:
+                msg.warn("Spans may not be distinct from the rest of the corpus")
+            else:
+                msg.good("Spans are distinct from the rest of the corpus")
+
+            p_spans = span_characteristics["p_spans"].values()
+            all_span_tokens: Counter = sum(p_spans, Counter())
+            most_common_spans = [w for w, _ in all_span_tokens.most_common(10)]
+            msg.text(
+                "10 most common span tokens: {}".format(
+                    _format_labels(most_common_spans)
+                ),
+                show=verbose,
+            )
+
+            # Add report regarding span boundary characteristics
+            if span_characteristics["avg_bd"] < BOUNDARY_DISTINCT_THRESHOLD:
+                msg.warn("Boundary tokens are not distinct from the rest of the corpus")
+            else:
+                msg.good("Boundary tokens are distinct from the rest of the corpus")
+
+            p_bounds = span_characteristics["p_bounds"].values()
+            all_span_bound_tokens: Counter = sum(p_bounds, Counter())
+            most_common_bounds = [w for w, _ in all_span_bound_tokens.most_common(10)]
+            msg.text(
+                "10 most common span boundary tokens: {}".format(
+                    _format_labels(most_common_bounds)
+                ),
+                show=verbose,
+            )
+
         if has_low_data_warning:
             msg.text(
                 f"To train a new span type, your data should include at "
@@ -255,7 +355,7 @@ def debug_data(
                 show=verbose,
             )
         else:
-            msg.good("Examples without ocurrences available for all labels")
+            msg.good("Examples without occurrences available for all labels")
 
     if "ner" in factory_names:
         # Get all unique NER labels present in the data
@@ -282,7 +382,7 @@ def debug_data(
             if label != "-"
         ]
         labels_with_counts = _format_labels(labels_with_counts, counts=True)
-        msg.text(f"Labels in train data: {_format_labels(labels)}", show=verbose)
+        msg.text(f"Labels in train data: {labels_with_counts}", show=verbose)
         missing_labels = model_labels - labels
         if missing_labels:
             msg.warn(
@@ -440,9 +540,13 @@ def debug_data(
 
     if "tagger" in factory_names:
         msg.divider("Part-of-speech Tagging")
-        label_list = [label for label in gold_train_data["tags"]]
-        model_labels = _get_labels_from_model(nlp, "tagger")
+        label_list, counts = zip(*gold_train_data["tags"].items())
         msg.info(f"{len(label_list)} label(s) in train data")
+        p = numpy.array(counts)
+        p = p / p.sum()
+        norm_entropy = (-p * numpy.log2(p)).sum() / numpy.log2(len(label_list))
+        msg.info(f"{norm_entropy} is the normalised label entropy")
+        model_labels = _get_labels_from_model(nlp, "tagger")
         labels = set(label_list)
         missing_labels = model_labels - labels
         if missing_labels:
@@ -591,6 +695,59 @@ def debug_data(
                 f"Found {gold_train_data['n_cycles']} projectivized train sentence(s) with cycles"
             )
 
+    if "trainable_lemmatizer" in factory_names:
+        msg.divider("Trainable Lemmatizer")
+        trees_train: Set[str] = gold_train_data["lemmatizer_trees"]
+        trees_dev: Set[str] = gold_dev_data["lemmatizer_trees"]
+        # This is necessary context when someone is attempting to interpret whether the
+        # number of trees exclusively in the dev set is meaningful.
+        msg.info(f"{len(trees_train)} lemmatizer trees generated from training data")
+        msg.info(f"{len(trees_dev)} lemmatizer trees generated from dev data")
+        dev_not_train = trees_dev - trees_train
+
+        if len(dev_not_train) != 0:
+            pct = len(dev_not_train) / len(trees_dev)
+            msg.info(
+                f"{len(dev_not_train)} lemmatizer trees ({pct*100:.1f}% of dev trees)"
+                " were found exclusively in the dev data."
+            )
+        else:
+            # Would we ever expect this case? It seems like it would be pretty rare,
+            # and we might actually want a warning?
+            msg.info("All trees in dev data present in training data.")
+
+        if gold_train_data["n_low_cardinality_lemmas"] > 0:
+            n = gold_train_data["n_low_cardinality_lemmas"]
+            msg.warn(f"{n} training docs with 0 or 1 unique lemmas.")
+
+        if gold_dev_data["n_low_cardinality_lemmas"] > 0:
+            n = gold_dev_data["n_low_cardinality_lemmas"]
+            msg.warn(f"{n} dev docs with 0 or 1 unique lemmas.")
+
+        if gold_train_data["no_lemma_annotations"] > 0:
+            n = gold_train_data["no_lemma_annotations"]
+            msg.warn(f"{n} training docs with no lemma annotations.")
+        else:
+            msg.good("All training docs have lemma annotations.")
+
+        if gold_dev_data["no_lemma_annotations"] > 0:
+            n = gold_dev_data["no_lemma_annotations"]
+            msg.warn(f"{n} dev docs with no lemma annotations.")
+        else:
+            msg.good("All dev docs have lemma annotations.")
+
+        if gold_train_data["partial_lemma_annotations"] > 0:
+            n = gold_train_data["partial_lemma_annotations"]
+            msg.info(f"{n} training docs with partial lemma annotations.")
+        else:
+            msg.good("All training docs have complete lemma annotations.")
+
+        if gold_dev_data["partial_lemma_annotations"] > 0:
+            n = gold_dev_data["partial_lemma_annotations"]
+            msg.info(f"{n} dev docs with partial lemma annotations.")
+        else:
+            msg.good("All dev docs have complete lemma annotations.")
+
     msg.divider("Summary")
     good_counts = msg.counts[MESSAGES.GOOD]
     warn_counts = msg.counts[MESSAGES.WARN]
@@ -638,6 +795,9 @@ def _compile_gold(
         "words": Counter(),
         "roots": Counter(),
         "spancat": dict(),
+        "spans_length": dict(),
+        "spans_per_type": dict(),
+        "sb_per_type": dict(),
         "ws_ents": 0,
         "boundary_cross_ents": 0,
         "n_words": 0,
@@ -649,7 +809,13 @@ def _compile_gold(
         "n_cats_multilabel": 0,
         "n_cats_bad_values": 0,
         "texts": set(),
+        "lemmatizer_trees": set(),
+        "no_lemma_annotations": 0,
+        "partial_lemma_annotations": 0,
+        "n_low_cardinality_lemmas": 0,
     }
+    if "trainable_lemmatizer" in factory_names:
+        trees = EditTrees(nlp.vocab.strings)
     for eg in examples:
         gold = eg.reference
         doc = eg.predicted
@@ -676,21 +842,66 @@ def _compile_gold(
                     # "Illegal" whitespace entity
                     data["ws_ents"] += 1
                 if label.startswith(("B-", "U-")):
-                    combined_label = label.split("-")[1]
+                    combined_label = remove_bilu_prefix(label)
                     data["ner"][combined_label] += 1
-                if sent_starts[i] == True and label.startswith(("I-", "L-")):
+                if sent_starts[i] and label.startswith(("I-", "L-")):
                     data["boundary_cross_ents"] += 1
                 elif label == "-":
                     data["ner"]["-"] += 1
-        if "spancat" in factory_names:
-            for span_key in list(eg.reference.spans.keys()):
-                if span_key not in data["spancat"]:
-                    data["spancat"][span_key] = Counter()
-                for i, span in enumerate(eg.reference.spans[span_key]):
+        if "spancat" in factory_names or "spancat_singlelabel" in factory_names:
+            for spans_key in list(eg.reference.spans.keys()):
+                # Obtain the span frequency
+                if spans_key not in data["spancat"]:
+                    data["spancat"][spans_key] = Counter()
+                for i, span in enumerate(eg.reference.spans[spans_key]):
                     if span.label_ is None:
                         continue
                     else:
-                        data["spancat"][span_key][span.label_] += 1
+                        data["spancat"][spans_key][span.label_] += 1
+
+                # Obtain the span length
+                if spans_key not in data["spans_length"]:
+                    data["spans_length"][spans_key] = dict()
+                for span in gold.spans[spans_key]:
+                    if span.label_ is None:
+                        continue
+                    if span.label_ not in data["spans_length"][spans_key]:
+                        data["spans_length"][spans_key][span.label_] = []
+                    data["spans_length"][spans_key][span.label_].append(len(span))
+
+                # Obtain spans per span type
+                if spans_key not in data["spans_per_type"]:
+                    data["spans_per_type"][spans_key] = dict()
+                for span in gold.spans[spans_key]:
+                    if span.label_ not in data["spans_per_type"][spans_key]:
+                        data["spans_per_type"][spans_key][span.label_] = []
+                    data["spans_per_type"][spans_key][span.label_].append(span)
+
+                # Obtain boundary tokens per span type
+                window_size = 1
+                if spans_key not in data["sb_per_type"]:
+                    data["sb_per_type"][spans_key] = dict()
+                for span in gold.spans[spans_key]:
+                    if span.label_ not in data["sb_per_type"][spans_key]:
+                        # Creating a data structure that holds the start and
+                        # end tokens for each span type
+                        data["sb_per_type"][spans_key][span.label_] = {
+                            "start": [],
+                            "end": [],
+                        }
+                    for offset in range(window_size):
+                        sb_start_idx = span.start - (offset + 1)
+                        if sb_start_idx >= 0:
+                            data["sb_per_type"][spans_key][span.label_]["start"].append(
+                                gold[sb_start_idx : sb_start_idx + 1]
+                            )
+
+                        sb_end_idx = span.end + (offset + 1)
+                        if sb_end_idx <= len(gold):
+                            data["sb_per_type"][spans_key][span.label_]["end"].append(
+                                gold[sb_end_idx - 1 : sb_end_idx]
+                            )
+
         if "textcat" in factory_names or "textcat_multilabel" in factory_names:
             data["cats"].update(gold.cats)
             if any(val not in (0, 1) for val in gold.cats.values()):
@@ -734,6 +945,25 @@ def _compile_gold(
                 data["n_nonproj"] += 1
             if nonproj.contains_cycle(aligned_heads):
                 data["n_cycles"] += 1
+        if "trainable_lemmatizer" in factory_names:
+            # from EditTreeLemmatizer._labels_from_data
+            if all(token.lemma == 0 for token in gold):
+                data["no_lemma_annotations"] += 1
+                continue
+            if any(token.lemma == 0 for token in gold):
+                data["partial_lemma_annotations"] += 1
+            lemma_set = set()
+            for token in gold:
+                if token.lemma != 0:
+                    lemma_set.add(token.lemma)
+                    tree_id = trees.add(token.text, token.lemma_)
+                    tree_str = trees.tree_to_str(tree_id)
+                    data["lemmatizer_trees"].add(tree_str)
+            # We want to identify cases where lemmas aren't assigned
+            # or are all assigned the same value, as this would indicate
+            # an issue since we're expecting a large set of lemmas
+            if len(lemma_set) < 2 and len(gold) > 1:
+                data["n_low_cardinality_lemmas"] += 1
     return data
 
 
@@ -761,6 +991,16 @@ def _format_labels(
     return ", ".join([f"'{l}'" for l in cast(Iterable[str], labels)])
 
 
+def _format_freqs(freqs: Dict[int, float], sort: bool = True) -> str:
+    if sort:
+        freqs = dict(sorted(freqs.items()))
+
+    _freqs = [(str(k), v) for k, v in freqs.items()]
+    return ", ".join(
+        [f"{l} ({c}%)" for l, c in cast(Iterable[Tuple[str, float]], _freqs)]
+    )
+
+
 def _get_examples_without_label(
     data: Sequence[Example],
     label: str,
@@ -771,7 +1011,7 @@ def _get_examples_without_label(
     for eg in data:
         if component == "ner":
             labels = [
-                label.split("-")[1]
+                remove_bilu_prefix(label)
                 for label in eg.get_aligned_ner()
                 if label not in ("O", "-", None)
             ]
@@ -797,6 +1037,7 @@ def _get_labels_from_model(nlp: Language, factory_name: str) -> Set[str]:
     labels: Set[str] = set()
     for pipe_name in pipe_names:
         pipe = nlp.get_pipe(pipe_name)
+        assert isinstance(pipe, TrainablePipe)
         labels.update(pipe.labels)
     return labels
 
@@ -805,7 +1046,7 @@ def _get_labels_from_spancat(nlp: Language) -> Dict[str, Set[str]]:
     pipe_names = [
         pipe_name
         for pipe_name in nlp.pipe_names
-        if nlp.get_pipe_meta(pipe_name).factory == "spancat"
+        if nlp.get_pipe_meta(pipe_name).factory in ("spancat", "spancat_singlelabel")
     ]
     labels: Dict[str, Set[str]] = {}
     for pipe_name in pipe_names:
@@ -815,3 +1056,177 @@ def _get_labels_from_spancat(nlp: Language) -> Dict[str, Set[str]]:
             labels[pipe.key] = set()
         labels[pipe.key].update(pipe.labels)
     return labels
+
+
+def _gmean(l: List) -> float:
+    """Compute geometric mean of a list"""
+    return math.exp(math.fsum(math.log(i) for i in l) / len(l))
+
+
+def _wgt_average(metric: Dict[str, float], frequencies: Counter) -> float:
+    total = sum(value * frequencies[span_type] for span_type, value in metric.items())
+    return total / sum(frequencies.values())
+
+
+def _get_distribution(docs, normalize: bool = True) -> Counter:
+    """Get the frequency distribution given a set of Docs"""
+    word_counts: Counter = Counter()
+    for doc in docs:
+        for token in doc:
+            # Normalize the text
+            t = token.text.lower().replace("``", '"').replace("''", '"')
+            word_counts[t] += 1
+    if normalize:
+        total = sum(word_counts.values(), 0.0)
+        word_counts = Counter({k: v / total for k, v in word_counts.items()})
+    return word_counts
+
+
+def _get_kl_divergence(p: Counter, q: Counter) -> float:
+    """Compute the Kullback-Leibler divergence from two frequency distributions"""
+    total = 0.0
+    for word, p_word in p.items():
+        total += p_word * math.log(p_word / q[word])
+    return total
+
+
+def _format_span_row(span_data: List[Dict], labels: List[str]) -> List[Any]:
+    """Compile into one list for easier reporting"""
+    d = {
+        label: [label] + list(_format_number(d[label]) for d in span_data)
+        for label in labels
+    }
+    return list(d.values())
+
+
+def _get_span_characteristics(
+    examples: List[Example], compiled_gold: Dict[str, Any], spans_key: str
+) -> Dict[str, Any]:
+    """Obtain all span characteristics"""
+    data_labels = compiled_gold["spancat"][spans_key]
+    # Get lengths
+    span_length = {
+        label: _gmean(l)
+        for label, l in compiled_gold["spans_length"][spans_key].items()
+    }
+    spans_per_type = {
+        label: len(spans)
+        for label, spans in compiled_gold["spans_per_type"][spans_key].items()
+    }
+    min_lengths = [min(l) for l in compiled_gold["spans_length"][spans_key].values()]
+    max_lengths = [max(l) for l in compiled_gold["spans_length"][spans_key].values()]
+
+    # Get relevant distributions: corpus, spans, span boundaries
+    p_corpus = _get_distribution([eg.reference for eg in examples], normalize=True)
+    p_spans = {
+        label: _get_distribution(spans, normalize=True)
+        for label, spans in compiled_gold["spans_per_type"][spans_key].items()
+    }
+    p_bounds = {
+        label: _get_distribution(sb["start"] + sb["end"], normalize=True)
+        for label, sb in compiled_gold["sb_per_type"][spans_key].items()
+    }
+
+    # Compute for actual span characteristics
+    span_distinctiveness = {
+        label: _get_kl_divergence(freq_dist, p_corpus)
+        for label, freq_dist in p_spans.items()
+    }
+    sb_distinctiveness = {
+        label: _get_kl_divergence(freq_dist, p_corpus)
+        for label, freq_dist in p_bounds.items()
+    }
+
+    return {
+        "sd": span_distinctiveness,
+        "bd": sb_distinctiveness,
+        "spans_per_type": spans_per_type,
+        "lengths": span_length,
+        "min_length": min(min_lengths),
+        "max_length": max(max_lengths),
+        "avg_sd": _wgt_average(span_distinctiveness, data_labels),
+        "avg_bd": _wgt_average(sb_distinctiveness, data_labels),
+        "avg_length": _wgt_average(span_length, data_labels),
+        "labels": list(data_labels.keys()),
+        "p_spans": p_spans,
+        "p_bounds": p_bounds,
+    }
+
+
+def _print_span_characteristics(span_characteristics: Dict[str, Any]):
+    """Print all span characteristics into a table"""
+    headers = ("Span Type", "Length", "SD", "BD", "N")
+    # Wasabi has this at 30 by default, but we might have some long labels
+    max_col = max(30, max(len(label) for label in span_characteristics["labels"]))
+    # Prepare table data with all span characteristics
+    table_data = [
+        span_characteristics["lengths"],
+        span_characteristics["sd"],
+        span_characteristics["bd"],
+        span_characteristics["spans_per_type"],
+    ]
+    table = _format_span_row(
+        span_data=table_data, labels=span_characteristics["labels"]
+    )
+    # Prepare table footer with weighted averages
+    footer_data = [
+        span_characteristics["avg_length"],
+        span_characteristics["avg_sd"],
+        span_characteristics["avg_bd"],
+    ]
+
+    footer = (
+        ["Wgt. Average"] + ["{:.2f}".format(round(f, 2)) for f in footer_data] + ["-"]
+    )
+    msg.table(
+        table,
+        footer=footer,
+        header=headers,
+        divider=True,
+        aligns=["l"] + ["r"] * (len(footer_data) + 1),
+        max_col=max_col,
+    )
+
+
+def _get_spans_length_freq_dist(
+    length_dict: Dict, threshold=SPAN_LENGTH_THRESHOLD_PERCENTAGE
+) -> Dict[int, float]:
+    """Get frequency distribution of spans length under a certain threshold"""
+    all_span_lengths = []
+    for _, lengths in length_dict.items():
+        all_span_lengths.extend(lengths)
+
+    freq_dist: Counter = Counter()
+    for i in all_span_lengths:
+        if freq_dist.get(i):
+            freq_dist[i] += 1
+        else:
+            freq_dist[i] = 1
+
+    # We will be working with percentages instead of raw counts
+    freq_dist_percentage = {}
+    for span_length, count in freq_dist.most_common():
+        percentage = (count / len(all_span_lengths)) * 100.0
+        percentage = round(percentage, 2)
+        freq_dist_percentage[span_length] = percentage
+
+    return freq_dist_percentage
+
+
+def _filter_spans_length_freq_dist(
+    freq_dist: Dict[int, float], threshold: int
+) -> Dict[int, float]:
+    """Filter frequency distribution with respect to a threshold
+
+    We're going to filter all the span lengths that fall
+    around a percentage threshold when summed.
+    """
+    total = 0.0
+    filtered_freq_dist = {}
+    for span_length, dist in freq_dist.items():
+        if total >= threshold:
+            break
+        else:
+            filtered_freq_dist[span_length] = dist
+        total += dist
+    return filtered_freq_dist

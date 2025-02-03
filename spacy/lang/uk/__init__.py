@@ -1,18 +1,24 @@
-from typing import Optional, Callable
+from typing import Callable, Optional
 
 from thinc.api import Model
 
-from .tokenizer_exceptions import TOKENIZER_EXCEPTIONS
-from .stop_words import STOP_WORDS
-from .lex_attrs import LEX_ATTRS
+from ...language import BaseDefaults, Language
+from ..punctuation import (
+    COMBINING_DIACRITICS_TOKENIZER_INFIXES,
+    COMBINING_DIACRITICS_TOKENIZER_SUFFIXES,
+)
 from .lemmatizer import UkrainianLemmatizer
-from ...language import Language, BaseDefaults
+from .lex_attrs import LEX_ATTRS
+from .stop_words import STOP_WORDS
+from .tokenizer_exceptions import TOKENIZER_EXCEPTIONS
 
 
 class UkrainianDefaults(BaseDefaults):
     tokenizer_exceptions = TOKENIZER_EXCEPTIONS
     lex_attr_getters = LEX_ATTRS
     stop_words = STOP_WORDS
+    suffixes = COMBINING_DIACRITICS_TOKENIZER_SUFFIXES
+    infixes = COMBINING_DIACRITICS_TOKENIZER_INFIXES
 
 
 class Ukrainian(Language):
@@ -25,7 +31,7 @@ class Ukrainian(Language):
     assigns=["token.lemma"],
     default_config={
         "model": None,
-        "mode": "pymorphy2",
+        "mode": "pymorphy3",
         "overwrite": False,
         "scorer": {"@scorers": "spacy.lemmatizer_scorer.v1"},
     },

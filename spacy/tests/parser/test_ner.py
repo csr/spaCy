@@ -1,23 +1,23 @@
+import logging
 import random
 
 import pytest
 from numpy.testing import assert_equal
 
+from spacy import registry, util
 from spacy.attrs import ENT_IOB
-from spacy import util, registry
 from spacy.lang.en import English
 from spacy.lang.it import Italian
 from spacy.language import Language
 from spacy.lookups import Lookups
+from spacy.pipeline import EntityRecognizer
 from spacy.pipeline._parser_internals.ner import BiluoPushDown
-from spacy.training import Example, iob_to_biluo
+from spacy.pipeline.ner import DEFAULT_NER_MODEL
 from spacy.tokens import Doc, Span
+from spacy.training import Example, iob_to_biluo, split_bilu_label
 from spacy.vocab import Vocab
-import logging
 
 from ..util import make_tempdir
-from ...pipeline import EntityRecognizer
-from ...pipeline.ner import DEFAULT_NER_MODEL
 
 TRAIN_DATA = [
     ("Who is Shaka Khan?", {"entities": [(7, 17, "PERSON")]}),
@@ -110,6 +110,9 @@ def test_issue2385():
     # maintain support for iob2 format
     tags3 = ("B-PERSON", "I-PERSON", "B-PERSON")
     assert iob_to_biluo(tags3) == ["B-PERSON", "L-PERSON", "U-PERSON"]
+    # ensure it works with hyphens in the name
+    tags4 = ("B-MULTI-PERSON", "I-MULTI-PERSON", "B-MULTI-PERSON")
+    assert iob_to_biluo(tags4) == ["B-MULTI-PERSON", "L-MULTI-PERSON", "U-MULTI-PERSON"]
 
 
 @pytest.mark.issue(2800)
@@ -152,6 +155,24 @@ def test_issue3209():
     model.attrs["resize_output"](model, ner.moves.n_moves)
     nlp2.from_bytes(nlp.to_bytes())
     assert ner2.move_names == move_names
+
+
+def test_labels_from_BILUO():
+    """Test that labels are inferred correctly when there's a - in label."""
+    nlp = English()
+    ner = nlp.add_pipe("ner")
+    ner.add_label("LARGE-ANIMAL")
+    nlp.initialize()
+    move_names = [
+        "O",
+        "B-LARGE-ANIMAL",
+        "I-LARGE-ANIMAL",
+        "L-LARGE-ANIMAL",
+        "U-LARGE-ANIMAL",
+    ]
+    labels = {"LARGE-ANIMAL"}
+    assert ner.move_names == move_names
+    assert set(ner.labels) == labels
 
 
 @pytest.mark.issue(4267)
@@ -298,7 +319,7 @@ def test_oracle_moves_missing_B(en_vocab):
         elif tag == "O":
             moves.add_action(move_types.index("O"), "")
         else:
-            action, label = tag.split("-")
+            action, label = split_bilu_label(tag)
             moves.add_action(move_types.index("B"), label)
             moves.add_action(move_types.index("I"), label)
             moves.add_action(move_types.index("L"), label)
@@ -324,7 +345,7 @@ def test_oracle_moves_whitespace(en_vocab):
         elif tag == "O":
             moves.add_action(move_types.index("O"), "")
         else:
-            action, label = tag.split("-")
+            action, label = split_bilu_label(tag)
             moves.add_action(move_types.index(action), label)
     moves.get_oracle_sequence(example)
 
@@ -707,9 +728,9 @@ def test_neg_annotation(neg_key):
     ner.add_label("ORG")
     example = Example.from_dict(neg_doc, {"entities": [(7, 17, "PERSON")]})
     example.reference.spans[neg_key] = [
-        Span(neg_doc, 2, 4, "ORG"),
-        Span(neg_doc, 2, 3, "PERSON"),
-        Span(neg_doc, 1, 4, "PERSON"),
+        Span(example.reference, 2, 4, "ORG"),
+        Span(example.reference, 2, 3, "PERSON"),
+        Span(example.reference, 1, 4, "PERSON"),
     ]
 
     optimizer = nlp.initialize()
@@ -734,7 +755,7 @@ def test_neg_annotation_conflict(neg_key):
     ner.add_label("PERSON")
     ner.add_label("LOC")
     example = Example.from_dict(neg_doc, {"entities": [(7, 17, "PERSON")]})
-    example.reference.spans[neg_key] = [Span(neg_doc, 2, 4, "PERSON")]
+    example.reference.spans[neg_key] = [Span(example.reference, 2, 4, "PERSON")]
     assert len(example.reference.ents) == 1
     assert example.reference.ents[0].text == "Shaka Khan"
     assert example.reference.ents[0].label_ == "PERSON"
@@ -767,7 +788,7 @@ def test_beam_valid_parse(neg_key):
 
     doc = Doc(nlp.vocab, words=tokens)
     example = Example.from_dict(doc, {"ner": iob})
-    neg_span = Span(doc, 50, 53, "ORG")
+    neg_span = Span(example.reference, 50, 53, "ORG")
     example.reference.spans[neg_key] = [neg_span]
 
     optimizer = nlp.initialize()

@@ -1,18 +1,32 @@
 # cython: infer_types=True
+# cython: profile=False
 cimport cython
-from libc.string cimport memcpy
-from libcpp.set cimport set
+
+from contextlib import contextmanager
+from typing import List, Optional
+
 from libc.stdint cimport uint32_t
-from murmurhash.mrmr cimport hash64, hash32
+from libc.string cimport memcpy
+from murmurhash.mrmr cimport hash32, hash64
+from preshed.maps cimport map_clear
 
 import srsly
 
 from .typedefs cimport hash_t
 
+from . import util
+from .errors import Errors
 from .symbols import IDS as SYMBOLS_BY_STR
 from .symbols import NAMES as SYMBOLS_BY_INT
-from .errors import Errors
-from . import util
+
+
+# Not particularly elegant, but this is faster than `isinstance(key, numbers.Integral)`
+cdef inline bint _try_coerce_to_hash(object key, hash_t* out_hash):
+    try:
+        out_hash[0] = key
+        return True
+    except:  # no-cython-lint
+        return False
 
 
 def get_string_id(key):
@@ -22,15 +36,27 @@ def get_string_id(key):
     This function optimises for convenience over performance, so shouldn't be
     used in tight loops.
     """
-    if not isinstance(key, str):
-        return key
-    elif key in SYMBOLS_BY_STR:
-        return SYMBOLS_BY_STR[key]
-    elif not key:
-        return 0
+    cdef hash_t str_hash
+    if isinstance(key, str):
+        if len(key) == 0:
+            return 0
+
+        symbol = SYMBOLS_BY_STR.get(key, None)
+        if symbol is not None:
+            return symbol
+        else:
+            chars = key.encode("utf8")
+            return hash_utf8(chars, len(chars))
+    elif _try_coerce_to_hash(key, &str_hash):
+        # Coerce the integral key to the expected primitive hash type.
+        # This ensures that custom/overloaded "primitive" data types
+        # such as those implemented by numpy are not inadvertently used
+        # downsteam (as these are internally implemented as custom PyObjects
+        # whose comparison operators can incur a significant overhead).
+        return str_hash
     else:
-        chars = key.encode("utf8")
-        return hash_utf8(chars, len(chars))
+        # TODO: Raise an error instead
+        return key
 
 
 cpdef hash_t hash_string(str string) except 0:
@@ -67,7 +93,6 @@ cdef Utf8Str* _allocate(Pool mem, const unsigned char* chars, uint32_t length) e
     cdef int n_length_bytes
     cdef int i
     cdef Utf8Str* string = <Utf8Str*>mem.alloc(1, sizeof(Utf8Str))
-    cdef uint32_t ulength = length
     if length < sizeof(string.s):
         string.s[0] = <unsigned char>length
         memcpy(&string.s[1], chars, length)
@@ -99,10 +124,11 @@ cdef class StringStore:
         strings (iterable): A sequence of unicode strings to add to the store.
         """
         self.mem = Pool()
+        self._non_temp_mem = self.mem
         self._map = PreshMap()
         if strings is not None:
             for string in strings:
-                self.add(string)
+                self.add(string, allow_transient=False)
 
     def __getitem__(self, object string_or_id):
         """Retrieve a string from a given hash, or vice versa.
@@ -110,24 +136,35 @@ cdef class StringStore:
         string_or_id (bytes, str or uint64): The value to encode.
         Returns (str / uint64): The value to be retrieved.
         """
-        if isinstance(string_or_id, str) and len(string_or_id) == 0:
-            return 0
-        elif string_or_id == 0:
-            return ""
-        elif string_or_id in SYMBOLS_BY_STR:
-            return SYMBOLS_BY_STR[string_or_id]
-        cdef hash_t key
+        cdef hash_t str_hash
+        cdef Utf8Str* utf8str = NULL
+
         if isinstance(string_or_id, str):
-            key = hash_string(string_or_id)
-            return key
+            if len(string_or_id) == 0:
+                return 0
+
+            # Return early if the string is found in the symbols LUT.
+            symbol = SYMBOLS_BY_STR.get(string_or_id, None)
+            if symbol is not None:
+                return symbol
+            else:
+                return hash_string(string_or_id)
         elif isinstance(string_or_id, bytes):
-            key = hash_utf8(string_or_id, len(string_or_id))
-            return key
-        elif string_or_id < len(SYMBOLS_BY_INT):
-            return SYMBOLS_BY_INT[string_or_id]
+            return hash_utf8(string_or_id, len(string_or_id))
+        elif _try_coerce_to_hash(string_or_id, &str_hash):
+            if str_hash == 0:
+                return ""
+            elif str_hash < len(SYMBOLS_BY_INT):
+                return SYMBOLS_BY_INT[str_hash]
+            else:
+                utf8str = <Utf8Str*>self._map.get(str_hash)
+                if utf8str is NULL:
+                    raise KeyError(Errors.E018.format(hash_value=string_or_id))
+                else:
+                    return decode_Utf8Str(utf8str)
         else:
-            key = string_or_id
-            utf8str = <Utf8Str*>self._map.get(key)
+            # TODO: Raise an error instead
+            utf8str = <Utf8Str*>self._map.get(string_or_id)
             if utf8str is NULL:
                 raise KeyError(Errors.E018.format(hash_value=string_or_id))
             else:
@@ -147,57 +184,104 @@ cdef class StringStore:
         else:
             return self[key]
 
-    def add(self, string):
-        """Add a string to the StringStore.
-
-        string (str): The string to add.
-        RETURNS (uint64): The string's hash value.
-        """
-        if isinstance(string, str):
-            if string in SYMBOLS_BY_STR:
-                return SYMBOLS_BY_STR[string]
-            key = hash_string(string)
-            self.intern_unicode(string)
-        elif isinstance(string, bytes):
-            if string in SYMBOLS_BY_STR:
-                return SYMBOLS_BY_STR[string]
-            key = hash_utf8(string, len(string))
-            self._intern_utf8(string, len(string))
-        else:
-            raise TypeError(Errors.E017.format(value_type=type(string)))
-        return key
-
-    def __len__(self):
+    def __len__(self) -> int:
         """The number of strings in the store.
 
         RETURNS (int): The number of strings in the store.
         """
-        return self.keys.size()
+        return self.keys.size() + self._transient_keys.size()
 
-    def __contains__(self, string not None):
-        """Check whether a string is in the store.
+    @contextmanager
+    def memory_zone(self, mem: Optional[Pool] = None) -> Pool:
+        """Begin a block where all resources allocated during the block will
+        be freed at the end of it. If a resources was created within the
+        memory zone block, accessing it outside the block is invalid.
+        Behaviour of this invalid access is undefined. Memory zones should
+        not be nested.
 
-        string (str): The string to check.
+        The memory zone is helpful for services that need to process large
+        volumes of text with a defined memory budget.
+        """
+        if mem is None:
+            mem = Pool()
+        self.mem = mem
+        yield mem
+        for key in self._transient_keys:
+            map_clear(self._map.c_map, key)
+        self._transient_keys.clear()
+        self.mem = self._non_temp_mem
+
+    def add(self, string: str, allow_transient: Optional[bool] = None) -> int:
+        """Add a string to the StringStore.
+
+        string (str): The string to add.
+        allow_transient (bool): Allow the string to be stored in the 'transient'
+          map, which will be flushed at the end of the memory zone. Strings
+          encountered during arbitrary text processing should be added
+          with allow_transient=True, while labels and other strings used
+          internally should not.
+        RETURNS (uint64): The string's hash value.
+        """
+        if not string:
+            return 0
+        if allow_transient is None:
+            allow_transient = self.mem is not self._non_temp_mem
+        cdef hash_t str_hash
+        if isinstance(string, str):
+            if string in SYMBOLS_BY_STR:
+                return SYMBOLS_BY_STR[string]
+
+            string = string.encode("utf8")
+            str_hash = hash_utf8(string, len(string))
+            self._intern_utf8(string, len(string), &str_hash, allow_transient)
+        elif isinstance(string, bytes):
+            if string in SYMBOLS_BY_STR:
+                return SYMBOLS_BY_STR[string]
+            str_hash = hash_utf8(string, len(string))
+            self._intern_utf8(string, len(string), &str_hash, allow_transient)
+        else:
+            raise TypeError(Errors.E017.format(value_type=type(string)))
+        return str_hash
+
+    def __len__(self):
+        """The number of strings in the store.
+        if string in SYMBOLS_BY_STR:
+            return SYMBOLS_BY_STR[string]
+        else:
+            return self._intern_str(string, allow_transient)
+
+        RETURNS (int): The number of strings in the store.
+        """
+        return self.keys.size() + self._transient_keys.size()
+
+    def __contains__(self, string_or_id not None):
+        """Check whether a string or ID is in the store.
+
+        string_or_id (str or int): The string to check.
         RETURNS (bool): Whether the store contains the string.
         """
-        cdef hash_t key
-        if isinstance(string, int) or isinstance(string, long):
-            if string == 0:
+        cdef hash_t str_hash
+        if isinstance(string_or_id, str):
+            if len(string_or_id) == 0:
                 return True
-            key = string
-        elif len(string) == 0:
-            return True
-        elif string in SYMBOLS_BY_STR:
-            return True
-        elif isinstance(string, str):
-            key = hash_string(string)
+            elif string_or_id in SYMBOLS_BY_STR:
+                return True
+            str_hash = hash_string(string_or_id)
+        elif _try_coerce_to_hash(string_or_id, &str_hash):
+            pass
         else:
-            string = string.encode("utf8")
-            key = hash_utf8(string, len(string))
-        if key < len(SYMBOLS_BY_INT):
+            # TODO: Raise an error instead
+            if self._map.get(string_or_id) is not NULL:
+                return True
+            else:
+                return False
+        if str_hash < len(SYMBOLS_BY_INT):
             return True
         else:
-            return self._map.get(key) is not NULL
+            if self._map.get(str_hash) is not NULL:
+                return True
+            else:
+                return False
 
     def __iter__(self):
         """Iterate over the strings in the store, in order.
@@ -210,11 +294,28 @@ cdef class StringStore:
             key = self.keys[i]
             utf8str = <Utf8Str*>self._map.get(key)
             yield decode_Utf8Str(utf8str)
-        # TODO: Iterate OOV here?
+        for i in range(self._transient_keys.size()):
+            key = self._transient_keys[i]
+            utf8str = <Utf8Str*>self._map.get(key)
+            yield decode_Utf8Str(utf8str)
 
     def __reduce__(self):
         strings = list(self)
         return (StringStore, (strings,), None, None, None)
+
+    def values(self) -> List[int]:
+        """Iterate over the stored strings hashes in insertion order.
+
+        RETURNS: A list of string hashs.
+        """
+        cdef int i
+        hashes = [None] * self._keys.size()
+        for i in range(self._keys.size()):
+            hashes[i] = self._keys[i]
+        transient_hashes = [None] * self._transient_keys.size()
+        for i in range(self._transient_keys.size()):
+            transient_hashes[i] = self._transient_keys[i]
+        return hashes + transient_hashes
 
     def to_disk(self, path):
         """Save the current state to a directory.
@@ -239,7 +340,7 @@ cdef class StringStore:
         prev = list(self)
         self._reset_and_load(strings)
         for word in prev:
-            self.add(word)
+            self.add(word, allow_transient=False)
         return self
 
     def to_bytes(self, **kwargs):
@@ -259,30 +360,38 @@ cdef class StringStore:
         prev = list(self)
         self._reset_and_load(strings)
         for word in prev:
-            self.add(word)
+            self.add(word, allow_transient=False)
         return self
 
     def _reset_and_load(self, strings):
         self.mem = Pool()
+        self._non_temp_mem = self.mem
         self._map = PreshMap()
         self.keys.clear()
+        self._transient_keys.clear()
         for string in strings:
-            self.add(string)
+            self.add(string, allow_transient=False)
 
-    cdef const Utf8Str* intern_unicode(self, str py_string):
+    cdef const Utf8Str* intern_unicode(self, str py_string, bint allow_transient):
         # 0 means missing, but we don't bother offsetting the index.
         cdef bytes byte_string = py_string.encode("utf8")
-        return self._intern_utf8(byte_string, len(byte_string))
+        return self._intern_utf8(byte_string, len(byte_string), NULL, allow_transient)
 
     @cython.final
-    cdef const Utf8Str* _intern_utf8(self, char* utf8_string, int length):
+    cdef const Utf8Str* _intern_utf8(self, char* utf8_string, int length, hash_t* precalculated_hash, bint allow_transient):
         # TODO: This function's API/behaviour is an unholy mess...
         # 0 means missing, but we don't bother offsetting the index.
-        cdef hash_t key = hash_utf8(utf8_string, length)
+        cdef hash_t key = precalculated_hash[0] if precalculated_hash is not NULL else hash_utf8(utf8_string, length)
         cdef Utf8Str* value = <Utf8Str*>self._map.get(key)
         if value is not NULL:
             return value
-        value = _allocate(self.mem, <unsigned char*>utf8_string, length)
+        if allow_transient:
+            value = _allocate(self.mem, <unsigned char*>utf8_string, length)
+        else:
+            value = _allocate(self._non_temp_mem, <unsigned char*>utf8_string, length)
         self._map.set(key, value)
-        self.keys.push_back(key)
+        if allow_transient and self.mem is not self._non_temp_mem:
+            self._transient_keys.push_back(key)
+        else:
+            self.keys.push_back(key)
         return value

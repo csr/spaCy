@@ -1,10 +1,9 @@
 #!/usr/bin/env python
 from setuptools import Extension, setup, find_packages
 import sys
-import platform
 import numpy
-from distutils.command.build_ext import build_ext
-from distutils.sysconfig import get_python_inc
+from setuptools.command.build_ext import build_ext
+from sysconfig import get_path
 from pathlib import Path
 import shutil
 from Cython.Build import cythonize
@@ -23,16 +22,20 @@ Options.docstrings = True
 
 PACKAGES = find_packages()
 MOD_NAMES = [
+    "spacy.training.alignment_array",
     "spacy.training.example",
     "spacy.parts_of_speech",
     "spacy.strings",
     "spacy.lexeme",
     "spacy.vocab",
     "spacy.attrs",
-    "spacy.kb",
+    "spacy.kb.candidate",
+    "spacy.kb.kb",
+    "spacy.kb.kb_in_memory",
     "spacy.ml.parser_model",
     "spacy.morphology",
     "spacy.pipeline.dep_parser",
+    "spacy.pipeline._edit_tree_internals.edit_trees",
     "spacy.pipeline.morphologizer",
     "spacy.pipeline.multitask",
     "spacy.pipeline.ner",
@@ -75,38 +78,14 @@ COMPILER_DIRECTIVES = {
     "language_level": -3,
     "embedsignature": True,
     "annotation_typing": False,
+    "profile": sys.version_info < (3, 12),
 }
 # Files to copy into the package that are otherwise not included
 COPY_FILES = {
     ROOT / "setup.cfg": PACKAGE_ROOT / "tests" / "package",
     ROOT / "pyproject.toml": PACKAGE_ROOT / "tests" / "package",
     ROOT / "requirements.txt": PACKAGE_ROOT / "tests" / "package",
-    ROOT / "website" / "meta" / "universe.json": PACKAGE_ROOT / "tests" / "universe",
 }
-
-
-def is_new_osx():
-    """Check whether we're on OSX >= 10.7"""
-    if sys.platform != "darwin":
-        return False
-    mac_ver = platform.mac_ver()[0]
-    if mac_ver.startswith("10"):
-        minor_version = int(mac_ver.split(".")[1])
-        if minor_version >= 7:
-            return True
-        else:
-            return False
-    return False
-
-
-if is_new_osx():
-    # On Mac, use libc++ because Apple deprecated use of
-    # libstdc
-    COMPILE_OPTIONS["other"].append("-stdlib=libc++")
-    LINK_OPTIONS["other"].append("-lc++")
-    # g++ (used by unix compiler on mac) links to libstdc++ as a default lib.
-    # See: https://stackoverflow.com/questions/1653047/avoid-linking-to-libstdc
-    LINK_OPTIONS["other"].append("-nodefaultlibs")
 
 
 # By subclassing build_extensions we have the actual compiler that will be used which is really known only after finalize_options
@@ -125,6 +104,8 @@ class build_ext_options:
 
 class build_ext_subclass(build_ext, build_ext_options):
     def build_extensions(self):
+        if self.parallel is None and os.environ.get("SPACY_NUM_BUILD_JOBS") is not None:
+            self.parallel = int(os.environ.get("SPACY_NUM_BUILD_JOBS"))
         build_ext_options.build_options(self)
         build_ext.build_extensions(self)
 
@@ -199,13 +180,28 @@ def setup_package():
 
     include_dirs = [
         numpy.get_include(),
-        get_python_inc(plat_specific=True),
+        get_path("include"),
     ]
     ext_modules = []
+    ext_modules.append(
+        Extension(
+            "spacy.matcher.levenshtein",
+            [
+                "spacy/matcher/levenshtein.pyx",
+                "spacy/matcher/polyleven.c",
+            ],
+            language="c",
+            include_dirs=include_dirs,
+        )
+    )
     for name in MOD_NAMES:
         mod_path = name.replace(".", "/") + ".pyx"
         ext = Extension(
-            name, [mod_path], language="c++", include_dirs=include_dirs, extra_compile_args=["-std=c++11"]
+            name,
+            [mod_path],
+            language="c++",
+            include_dirs=include_dirs,
+            extra_compile_args=["-std=c++11"],
         )
         ext_modules.append(ext)
     print("Cythonizing sources")

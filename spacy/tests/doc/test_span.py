@@ -1,13 +1,13 @@
-import pytest
 import numpy
+import pytest
 from numpy.testing import assert_array_equal
+from thinc.api import get_current_ops
 
-from spacy.attrs import ORTH, LENGTH
+from spacy.attrs import LENGTH, ORTH
 from spacy.lang.en import English
 from spacy.tokens import Doc, Span, Token
-from spacy.vocab import Vocab
 from spacy.util import filter_spans
-from thinc.api import get_current_ops
+from spacy.vocab import Vocab
 
 from ..util import add_vecs_to_vocab
 from .test_underscore import clean_underscore  # noqa: F401
@@ -161,6 +161,18 @@ def test_char_span(doc, i_sent, i, j, text):
         assert not span
     else:
         assert span.text == text
+
+
+def test_char_span_attributes(doc):
+    label = "LABEL"
+    kb_id = "KB_ID"
+    span_id = "SPAN_ID"
+    span1 = doc.char_span(20, 45, label=label, kb_id=kb_id, span_id=span_id)
+    span2 = doc[1:].char_span(15, 40, label=label, kb_id=kb_id, span_id=span_id)
+    assert span1.text == span2.text
+    assert span1.label_ == span2.label_ == label
+    assert span1.kb_id_ == span2.kb_id_ == kb_id
+    assert span1.id_ == span2.id_ == span_id
 
 
 def test_spans_sent_spans(doc):
@@ -367,6 +379,14 @@ def test_spans_by_character(doc):
             span1.start_char + 1, span1.end_char, label="GPE", alignment_mode="unk"
         )
 
+    # Span.char_span + alignment mode "contract"
+    span2 = doc[0:2].char_span(
+        span1.start_char - 3, span1.end_char, label="GPE", alignment_mode="contract"
+    )
+    assert span1.start_char == span2.start_char
+    assert span1.end_char == span2.end_char
+    assert span2.label_ == "GPE"
+
 
 def test_span_to_array(doc):
     span = doc[1:-2]
@@ -428,10 +448,19 @@ def test_span_string_label_kb_id(doc):
     assert span.kb_id == doc.vocab.strings["Q342"]
 
 
+def test_span_string_label_id(doc):
+    span = Span(doc, 0, 1, label="hello", span_id="Q342")
+    assert span.label_ == "hello"
+    assert span.label == doc.vocab.strings["hello"]
+    assert span.id_ == "Q342"
+    assert span.id == doc.vocab.strings["Q342"]
+
+
 def test_span_attrs_writable(doc):
     span = Span(doc, 0, 1)
     span.label_ = "label"
     span.kb_id_ = "kb_id"
+    span.id_ = "id"
 
 
 def test_span_ents_property(doc):
@@ -573,6 +602,58 @@ def test_span_with_vectors(doc):
     doc.vocab.vectors = prev_vectors
 
 
+# fmt: off
+def test_span_comparison(doc):
+
+    # Identical start, end, only differ in label and kb_id
+    assert Span(doc, 0, 3) == Span(doc, 0, 3)
+    assert Span(doc, 0, 3, "LABEL") == Span(doc, 0, 3, "LABEL")
+    assert Span(doc, 0, 3, "LABEL", kb_id="KB_ID") == Span(doc, 0, 3, "LABEL", kb_id="KB_ID")
+
+    assert Span(doc, 0, 3) != Span(doc, 0, 3, "LABEL")
+    assert Span(doc, 0, 3) != Span(doc, 0, 3, "LABEL", kb_id="KB_ID")
+    assert Span(doc, 0, 3, "LABEL") != Span(doc, 0, 3, "LABEL", kb_id="KB_ID")
+
+    assert Span(doc, 0, 3) <= Span(doc, 0, 3) and Span(doc, 0, 3) >= Span(doc, 0, 3)
+    assert Span(doc, 0, 3, "LABEL") <= Span(doc, 0, 3, "LABEL") and Span(doc, 0, 3, "LABEL") >= Span(doc, 0, 3, "LABEL")
+    assert Span(doc, 0, 3, "LABEL", kb_id="KB_ID") <= Span(doc, 0, 3, "LABEL", kb_id="KB_ID")
+    assert Span(doc, 0, 3, "LABEL", kb_id="KB_ID") >= Span(doc, 0, 3, "LABEL", kb_id="KB_ID")
+
+    assert (Span(doc, 0, 3) < Span(doc, 0, 3, "", kb_id="KB_ID") < Span(doc, 0, 3, "LABEL") < Span(doc, 0, 3, "LABEL", kb_id="KB_ID"))
+    assert (Span(doc, 0, 3) <= Span(doc, 0, 3, "", kb_id="KB_ID") <= Span(doc, 0, 3, "LABEL") <= Span(doc, 0, 3, "LABEL", kb_id="KB_ID"))
+
+    assert (Span(doc, 0, 3, "LABEL", kb_id="KB_ID") > Span(doc, 0, 3, "LABEL") > Span(doc, 0, 3, "", kb_id="KB_ID") > Span(doc, 0, 3))
+    assert (Span(doc, 0, 3, "LABEL", kb_id="KB_ID") >= Span(doc, 0, 3, "LABEL") >= Span(doc, 0, 3, "", kb_id="KB_ID") >= Span(doc, 0, 3))
+
+    # Different end
+    assert Span(doc, 0, 3, "LABEL", kb_id="KB_ID") < Span(doc, 0, 4, "LABEL", kb_id="KB_ID")
+
+    assert Span(doc, 0, 3, "LABEL", kb_id="KB_ID") < Span(doc, 0, 4)
+    assert Span(doc, 0, 3, "LABEL", kb_id="KB_ID") <= Span(doc, 0, 4)
+    assert Span(doc, 0, 4) > Span(doc, 0, 3, "LABEL", kb_id="KB_ID")
+    assert Span(doc, 0, 4) >= Span(doc, 0, 3, "LABEL", kb_id="KB_ID")
+
+    # Different start
+    assert Span(doc, 0, 3, "LABEL", kb_id="KB_ID") != Span(doc, 1, 3, "LABEL", kb_id="KB_ID")
+
+    assert Span(doc, 0, 3, "LABEL", kb_id="KB_ID") < Span(doc, 1, 3)
+    assert Span(doc, 0, 3, "LABEL", kb_id="KB_ID") <= Span(doc, 1, 3)
+    assert Span(doc, 1, 3) > Span(doc, 0, 3, "LABEL", kb_id="KB_ID")
+    assert Span(doc, 1, 3) >= Span(doc, 0, 3, "LABEL", kb_id="KB_ID")
+
+    # Different start & different end
+    assert Span(doc, 0, 4, "LABEL", kb_id="KB_ID") != Span(doc, 1, 3, "LABEL", kb_id="KB_ID")
+
+    assert Span(doc, 0, 4, "LABEL", kb_id="KB_ID") < Span(doc, 1, 3)
+    assert Span(doc, 0, 4, "LABEL", kb_id="KB_ID") <= Span(doc, 1, 3)
+    assert Span(doc, 1, 3) > Span(doc, 0, 4, "LABEL", kb_id="KB_ID")
+    assert Span(doc, 1, 3) >= Span(doc, 0, 4, "LABEL", kb_id="KB_ID")
+
+    # Different id
+    assert Span(doc, 1, 3, span_id="AAA") < Span(doc, 1, 3, span_id="BBB")
+# fmt: on
+
+
 @pytest.mark.parametrize(
     "start,end,expected_sentences,expected_sentences_with_hook",
     [
@@ -606,3 +687,56 @@ def test_span_sents(doc, start, end, expected_sentences, expected_sentences_with
 def test_span_sents_not_parsed(doc_not_parsed):
     with pytest.raises(ValueError):
         list(Span(doc_not_parsed, 0, 3).sents)
+
+
+def test_span_group_copy(doc):
+    doc.spans["test"] = [doc[0:1], doc[2:4]]
+    assert len(doc.spans["test"]) == 2
+    doc_copy = doc.copy()
+    # check that the spans were indeed copied
+    assert len(doc_copy.spans["test"]) == 2
+    # add a new span to the original doc
+    doc.spans["test"].append(doc[3:4])
+    assert len(doc.spans["test"]) == 3
+    # check that the copy spans were not modified and this is an isolated doc
+    assert len(doc_copy.spans["test"]) == 2
+
+
+def test_for_partial_ent_sents():
+    """Spans may be associated with multiple sentences. These .sents should always be complete, not partial, sentences,
+    which this tests for.
+    """
+    doc = Doc(
+        English().vocab,
+        words=["Mahler's", "Symphony", "No.", "8", "was", "beautiful."],
+        sent_starts=[1, 0, 0, 1, 0, 0],
+    )
+    doc.set_ents([Span(doc, 1, 4, "WORK")])
+    # The specified entity is associated with both sentences in this doc, so we expect all sentences in the doc to be
+    # equal to the sentences referenced in ent.sents.
+    for doc_sent, ent_sent in zip(doc.sents, doc.ents[0].sents):
+        assert doc_sent == ent_sent
+
+
+def test_for_no_ent_sents():
+    """Span.sents() should set .sents correctly, even if Span in question is trailing and doesn't form a full
+    sentence.
+    """
+    doc = Doc(
+        English().vocab,
+        words=["This", "is", "a", "test.", "ENTITY"],
+        sent_starts=[1, 0, 0, 0, 1],
+    )
+    doc.set_ents([Span(doc, 4, 5, "WORK")])
+    sents = list(doc.ents[0].sents)
+    assert len(sents) == 1
+    assert str(sents[0]) == str(doc.ents[0].sent) == "ENTITY"
+
+
+def test_span_api_richcmp_other(en_tokenizer):
+    doc1 = en_tokenizer("a b")
+    doc2 = en_tokenizer("b c")
+    assert not doc1[1:2] == doc1[1]
+    assert not doc1[1:2] == doc2[0]
+    assert not doc1[1:2] == doc2[0:1]
+    assert not doc1[0:1] == doc2

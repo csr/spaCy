@@ -1,5 +1,6 @@
+from .dependencymatcher import DependencyMatcher
+from .levenshtein import levenshtein
 from .matcher import Matcher
 from .phrasematcher import PhraseMatcher
-from .dependencymatcher import DependencyMatcher
 
-__all__ = ["Matcher", "PhraseMatcher", "DependencyMatcher"]
+__all__ = ["DependencyMatcher", "Matcher", "PhraseMatcher", "levenshtein"]

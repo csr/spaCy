@@ -1,19 +1,22 @@
 import itertools
 import logging
+import warnings
 from unittest import mock
+
 import pytest
-from spacy.language import Language
-from spacy.tokens import Doc, Span
-from spacy.vocab import Vocab
-from spacy.training import Example
-from spacy.lang.en import English
-from spacy.lang.de import German
-from spacy.util import registry, ignore_error, raise_error, find_matching_language
-import spacy
 from thinc.api import CupyOps, NumpyOps, get_current_ops
 
-from .util import add_vecs_to_vocab, assert_docs_equal
+import spacy
+from spacy.lang.de import German
+from spacy.lang.en import English
+from spacy.language import Language
+from spacy.scorer import Scorer
+from spacy.tokens import Doc, Span
+from spacy.training import Example
+from spacy.util import find_matching_language, ignore_error, raise_error, registry
+from spacy.vocab import Vocab
 
+from .util import add_vecs_to_vocab, assert_docs_equal
 
 try:
     import torch
@@ -45,7 +48,7 @@ def assert_sents_error(doc):
 
 def warn_error(proc_name, proc, docs, e):
     logger = logging.getLogger("spacy")
-    logger.warning(f"Trouble with component {proc_name}.")
+    logger.warning("Trouble with component %s.", proc_name)
 
 
 @pytest.fixture
@@ -124,6 +127,112 @@ def test_evaluate_no_pipe(nlp):
     doc = nlp(text)
     nlp.add_pipe("test_evaluate_no_pipe")
     nlp.evaluate([Example.from_dict(doc, annots)])
+
+
+def test_evaluate_textcat_multilabel(en_vocab):
+    """Test that evaluate works with a multilabel textcat pipe."""
+    nlp = Language(en_vocab)
+    textcat_multilabel = nlp.add_pipe("textcat_multilabel")
+    for label in ("FEATURE", "REQUEST", "BUG", "QUESTION"):
+        textcat_multilabel.add_label(label)
+    nlp.initialize()
+
+    annots = {"cats": {"FEATURE": 1.0, "QUESTION": 1.0}}
+    doc = nlp.make_doc("hello world")
+    example = Example.from_dict(doc, annots)
+    scores = nlp.evaluate([example])
+    labels = nlp.get_pipe("textcat_multilabel").labels
+    for label in labels:
+        assert scores["cats_f_per_type"].get(label) is not None
+    for key in example.reference.cats.keys():
+        if key not in labels:
+            assert scores["cats_f_per_type"].get(key) is None
+
+
+def test_evaluate_multiple_textcat_final(en_vocab):
+    """Test that evaluate evaluates the final textcat component in a pipeline
+    with more than one textcat or textcat_multilabel."""
+    nlp = Language(en_vocab)
+    textcat = nlp.add_pipe("textcat")
+    for label in ("POSITIVE", "NEGATIVE"):
+        textcat.add_label(label)
+    textcat_multilabel = nlp.add_pipe("textcat_multilabel")
+    for label in ("FEATURE", "REQUEST", "BUG", "QUESTION"):
+        textcat_multilabel.add_label(label)
+    nlp.initialize()
+
+    annots = {
+        "cats": {
+            "POSITIVE": 1.0,
+            "NEGATIVE": 0.0,
+            "FEATURE": 1.0,
+            "QUESTION": 1.0,
+            "POSITIVE": 1.0,
+            "NEGATIVE": 0.0,
+        }
+    }
+    doc = nlp.make_doc("hello world")
+    example = Example.from_dict(doc, annots)
+    scores = nlp.evaluate([example])
+    # get the labels from the final pipe
+    labels = nlp.get_pipe(nlp.pipe_names[-1]).labels
+    for label in labels:
+        assert scores["cats_f_per_type"].get(label) is not None
+    for key in example.reference.cats.keys():
+        if key not in labels:
+            assert scores["cats_f_per_type"].get(key) is None
+
+
+def test_evaluate_multiple_textcat_separate(en_vocab):
+    """Test that evaluate can evaluate multiple textcat components separately
+    with custom scorers."""
+
+    def custom_textcat_score(examples, **kwargs):
+        scores = Scorer.score_cats(
+            examples,
+            "cats",
+            multi_label=False,
+            **kwargs,
+        )
+        return {f"custom_{k}": v for k, v in scores.items()}
+
+    @spacy.registry.scorers("test_custom_textcat_scorer")
+    def make_custom_textcat_scorer():
+        return custom_textcat_score
+
+    nlp = Language(en_vocab)
+    textcat = nlp.add_pipe(
+        "textcat",
+        config={"scorer": {"@scorers": "test_custom_textcat_scorer"}},
+    )
+    for label in ("POSITIVE", "NEGATIVE"):
+        textcat.add_label(label)
+    textcat_multilabel = nlp.add_pipe("textcat_multilabel")
+    for label in ("FEATURE", "REQUEST", "BUG", "QUESTION"):
+        textcat_multilabel.add_label(label)
+    nlp.initialize()
+
+    annots = {
+        "cats": {
+            "POSITIVE": 1.0,
+            "NEGATIVE": 0.0,
+            "FEATURE": 1.0,
+            "QUESTION": 1.0,
+            "POSITIVE": 1.0,
+            "NEGATIVE": 0.0,
+        }
+    }
+    doc = nlp.make_doc("hello world")
+    example = Example.from_dict(doc, annots)
+    scores = nlp.evaluate([example])
+    # check custom scores for the textcat pipe
+    assert "custom_cats_f_per_type" in scores
+    labels = nlp.get_pipe("textcat").labels
+    assert set(scores["custom_cats_f_per_type"].keys()) == set(labels)
+    # check default scores for the textcat_multilabel pipe
+    assert "cats_f_per_type" in scores
+    labels = nlp.get_pipe("textcat_multilabel").labels
+    assert set(scores["cats_f_per_type"].keys()) == set(labels)
 
 
 def vector_modification_pipe(doc):
@@ -220,7 +329,7 @@ def test_language_pipe_error_handler(n_process):
         nlp.set_error_handler(raise_error)
         with pytest.raises(ValueError):
             list(nlp.pipe(texts, n_process=n_process))
-        # set explicitely to ignoring
+        # set explicitly to ignoring
         nlp.set_error_handler(ignore_error)
         docs = list(nlp.pipe(texts, n_process=n_process))
         assert len(docs) == 0
@@ -630,9 +739,13 @@ def test_pass_doc_to_pipeline(nlp, n_process):
     assert doc.text == texts[0]
     assert len(doc.cats) > 0
     if isinstance(get_current_ops(), NumpyOps) or n_process < 2:
-        docs = nlp.pipe(docs, n_process=n_process)
-        assert [doc.text for doc in docs] == texts
-        assert all(len(doc.cats) for doc in docs)
+        # Catch warnings to ensure that all worker processes exited
+        # succesfully.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            docs = nlp.pipe(docs, n_process=n_process)
+            assert [doc.text for doc in docs] == texts
+            assert all(len(doc.cats) for doc in docs)
 
 
 def test_invalid_arg_to_pipeline(nlp):
@@ -659,3 +772,36 @@ def test_multiprocessing_gpu_warning(nlp2, texts):
             # Trigger multi-processing.
             for _ in docs:
                 pass
+
+
+def test_dot_in_factory_names(nlp):
+    Language.component("my_evil_component", func=evil_component)
+    nlp.add_pipe("my_evil_component")
+
+    with pytest.raises(ValueError, match="not permitted"):
+        Language.component("my.evil.component.v1", func=evil_component)
+
+    with pytest.raises(ValueError, match="not permitted"):
+        Language.factory("my.evil.component.v1", func=evil_component)
+
+
+def test_component_return():
+    """Test that an error is raised if components return a type other than a
+    doc."""
+    nlp = English()
+
+    @Language.component("test_component_good_pipe")
+    def good_pipe(doc):
+        return doc
+
+    nlp.add_pipe("test_component_good_pipe")
+    nlp("text")
+    nlp.remove_pipe("test_component_good_pipe")
+
+    @Language.component("test_component_bad_pipe")
+    def bad_pipe(doc):
+        return doc.text
+
+    nlp.add_pipe("test_component_bad_pipe")
+    with pytest.raises(ValueError, match="instead of a Doc"):
+        nlp("text")

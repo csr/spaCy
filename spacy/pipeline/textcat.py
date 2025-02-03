@@ -1,18 +1,18 @@
 from itertools import islice
-from typing import Iterable, Tuple, Optional, Dict, List, Callable, Any
-from thinc.api import get_array_module, Model, Optimizer, set_dropout_rate, Config
-from thinc.types import Floats2d
-import numpy
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from .trainable_pipe import TrainablePipe
-from ..language import Language
-from ..training import Example, validate_examples, validate_get_examples
+import numpy
+from thinc.api import Config, Model, Optimizer, get_array_module, set_dropout_rate
+from thinc.types import Floats2d
+
 from ..errors import Errors
+from ..language import Language
 from ..scorer import Scorer
 from ..tokens import Doc
+from ..training import Example, validate_examples, validate_get_examples
 from ..util import registry
 from ..vocab import Vocab
-
+from .trainable_pipe import TrainablePipe
 
 single_label_default_config = """
 [model]
@@ -24,8 +24,8 @@ single_label_default_config = """
 [model.tok2vec.embed]
 @architectures = "spacy.MultiHashEmbed.v2"
 width = 64
-rows = [2000, 2000, 1000, 1000, 1000, 1000]
-attrs = ["ORTH", "LOWER", "PREFIX", "SUFFIX", "SHAPE", "ID"]
+rows = [2000, 2000, 500, 1000, 500]
+attrs = ["NORM", "LOWER", "PREFIX", "SUFFIX", "SHAPE"]
 include_static_vectors = false
 
 [model.tok2vec.encode]
@@ -36,8 +36,9 @@ maxout_pieces = 3
 depth = 2
 
 [model.linear_model]
-@architectures = "spacy.TextCatBOW.v2"
+@architectures = "spacy.TextCatBOW.v3"
 exclusive_classes = true
+length = 262144
 ngram_size = 1
 no_output_layer = false
 """
@@ -45,16 +46,21 @@ DEFAULT_SINGLE_TEXTCAT_MODEL = Config().from_str(single_label_default_config)["m
 
 single_label_bow_config = """
 [model]
-@architectures = "spacy.TextCatBOW.v2"
+@architectures = "spacy.TextCatBOW.v3"
 exclusive_classes = true
+length = 262144
 ngram_size = 1
 no_output_layer = false
 """
 
 single_label_cnn_config = """
 [model]
-@architectures = "spacy.TextCatCNN.v2"
+@architectures = "spacy.TextCatReduce.v1"
 exclusive_classes = true
+use_reduce_first = false
+use_reduce_last = false
+use_reduce_max = false
+use_reduce_mean = true
 
 [model.tok2vec]
 @architectures = "spacy.HashEmbedCNN.v2"
@@ -72,9 +78,9 @@ subword_features = true
     "textcat",
     assigns=["doc.cats"],
     default_config={
-        "threshold": 0.5,
+        "threshold": 0.0,
         "model": DEFAULT_SINGLE_TEXTCAT_MODEL,
-        "scorer": {"@scorers": "spacy.textcat_scorer.v1"},
+        "scorer": {"@scorers": "spacy.textcat_scorer.v2"},
     },
     default_score_weights={
         "cats_score": 1.0,
@@ -87,7 +93,6 @@ subword_features = true
         "cats_macro_f": None,
         "cats_macro_auc": None,
         "cats_f_per_type": None,
-        "cats_macro_auc_per_type": None,
     },
 )
 def make_textcat(
@@ -118,7 +123,7 @@ def textcat_score(examples: Iterable[Example], **kwargs) -> Dict[str, Any]:
     )
 
 
-@registry.scorers("spacy.textcat_scorer.v1")
+@registry.scorers("spacy.textcat_scorer.v2")
 def make_textcat_scorer():
     return textcat_score
 
@@ -144,7 +149,8 @@ class TextCategorizer(TrainablePipe):
         model (thinc.api.Model): The Thinc Model powering the pipeline component.
         name (str): The component instance name, used to add entries to the
             losses during training.
-        threshold (float): Cutoff to consider a prediction "positive".
+        threshold (float): Unused, not needed for single-label (exclusive
+            classes) classification.
         scorer (Optional[Callable]): The scoring method. Defaults to
                 Scorer.score_cats for the attribute "cats".
 
@@ -154,9 +160,20 @@ class TextCategorizer(TrainablePipe):
         self.model = model
         self.name = name
         self._rehearsal_model = None
-        cfg = {"labels": [], "threshold": threshold, "positive_label": None}
+        cfg: Dict[str, Any] = {
+            "labels": [],
+            "threshold": threshold,
+            "positive_label": None,
+        }
         self.cfg = dict(cfg)
         self.scorer = scorer
+
+    @property
+    def support_missing_values(self):
+        # There are no missing values as the textcat should always
+        # predict exactly one label. All other labels are 0.0
+        # Subclasses may override this property to change internal behaviour.
+        return False
 
     @property
     def labels(self) -> Tuple[str]:
@@ -185,7 +202,7 @@ class TextCategorizer(TrainablePipe):
         if not any(len(doc) for doc in docs):
             # Handle cases where there are no tokens in any docs.
             tensors = [doc.tensor for doc in docs]
-            xp = get_array_module(tensors)
+            xp = self.model.ops.xp
             scores = xp.zeros((len(list(docs)), len(self.labels)))
             return scores
         scores = self.model.predict(docs)
@@ -276,7 +293,7 @@ class TextCategorizer(TrainablePipe):
             return losses
         set_dropout_rate(self.model, drop)
         scores, bp_scores = self.model.begin_update(docs)
-        target = self._rehearsal_model(examples)
+        target, _ = self._rehearsal_model.begin_update(docs)
         gradient = scores - target
         bp_scores(gradient)
         if sgd is not None:
@@ -294,7 +311,7 @@ class TextCategorizer(TrainablePipe):
             for j, label in enumerate(self.labels):
                 if label in eg.reference.cats:
                     truths[i, j] = eg.reference.cats[label]
-                else:
+                elif self.support_missing_values:
                     not_missing[i, j] = 0.0
         truths = self.model.ops.asarray(truths)  # type: ignore
         return truths, not_missing  # type: ignore
@@ -313,9 +330,9 @@ class TextCategorizer(TrainablePipe):
         self._validate_categories(examples)
         truths, not_missing = self._examples_to_truth(examples)
         not_missing = self.model.ops.asarray(not_missing)  # type: ignore
-        d_scores = (scores - truths) / scores.shape[0]
+        d_scores = scores - truths
         d_scores *= not_missing
-        mean_square_error = (d_scores**2).sum(axis=1).mean()
+        mean_square_error = (d_scores**2).mean()
         return float(mean_square_error), d_scores
 
     def add_label(self, label: str) -> int:
@@ -389,5 +406,9 @@ class TextCategorizer(TrainablePipe):
     def _validate_categories(self, examples: Iterable[Example]):
         """Check whether the provided examples all have single-label cats annotations."""
         for ex in examples:
-            if list(ex.reference.cats.values()).count(1.0) > 1:
+            vals = list(ex.reference.cats.values())
+            if vals.count(1.0) > 1:
                 raise ValueError(Errors.E895.format(value=ex.reference.cats))
+            for val in vals:
+                if not (val == 1.0 or val == 0.0):
+                    raise ValueError(Errors.E851.format(val=val))
